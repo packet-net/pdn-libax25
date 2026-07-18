@@ -8,6 +8,27 @@ AF_AX25 code just works against a pdn node when you preload the interposer shim:
 no source changes, no relinking — the `LD_PRELOAD` shim redirects the AF_AX25
 sockets to pdn over RHPv2.
 
+## Native AF_AX25 (these samples) vs IP-over-tun (`pdn-net`)
+
+There are **two ways to put software onto the packet network**, and these samples
+are the **native** one:
+
+- **Native AF_AX25 — this repo (`pdn-libax25`).** Your program addresses a
+  **callsign** and speaks AX.25 directly (connected sessions or UI datagrams).
+  No IP, no addressing overhead. The right path for the AX.25-native world: BBS
+  logins, `axcall`/`ax25d`/ax25-tools, keyboard-to-keyboard, callsign work.
+- **IP-over-tun — [`pdn-net`](https://github.com/packet-net/pdn-net).** Your
+  program addresses an **IP** and uses ordinary sockets; a `pdn0` tun interface
+  carries it over radio, so **any existing IP software works unmodified** (`ssh`,
+  `mosh`, `mqtt`, `git`), addressed by IP.
+
+**Rule of thumb: if your program knows about callsigns, use the native shim
+(here); if it only knows IP, use `pdn-net`.** Full rationale in packet.net
+`docs/network-integration-adr.md` ("two seams for two software worlds").
+
+*(Within the native shim there's a second, finer choice — connected mode vs
+UI/datagram — see [below](#when-to-use-which-connected-mode-vs-uidatagram).)*
+
 | Sample | Type | What it shows |
 |--------|------|---------------|
 | `ax25_connect.c` | `SOCK_SEQPACKET` | connected-mode **client** — call a station, send a line, print the reply |
