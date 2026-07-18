@@ -1,0 +1,5 @@
+# Built sample binaries (see samples/README.md — `make samples`).
+ax25_connect
+ax25_answer
+ax25_beacon
+ax25_ui_monitor

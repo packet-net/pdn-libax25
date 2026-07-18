@@ -10,7 +10,7 @@ It ships **two** native `.so` artifacts (both Rust `cdylib`s), licence
 | Artifact | Role |
 |----------|------|
 | **`libax25.so.1`** | Drop-in replacement for ve7fet **libax25**'s *helper* library — address parsing (`ax25_aton*`/`ax25_ntoa`/`ax25_cmp`/`ax25_validate`) and `axports` config parsing. libax25 has **no** connection code; apps link `-lax25` only for these helpers. SONAME is `libax25.so.1` (upstream real file `libax25.so.1.0.1`, pkg 1.2.2). |
-| **`ax25-interpose.so`** | An `LD_PRELOAD` libc interposer. It wraps the socket/IO calls, detects `AF_AX25` (family 3) + `SOCK_SEQPACKET` sockets, routes them to a pdn **RHPv2** connection, and passes every other call straight through to real libc via `dlsym(RTLD_NEXT, …)`. Build output is `libax25_interpose.so`. |
+| **`ax25-interpose.so`** | An `LD_PRELOAD` libc interposer. It wraps the socket/IO calls, detects `AF_AX25` (family 3) sockets — `SOCK_SEQPACKET` (connected sessions) and `SOCK_DGRAM` (connectionless UI) — routes them to a pdn **RHPv2** connection, and passes every other call straight through to real libc via `dlsym(RTLD_NEXT, …)`. Build output is `libax25_interpose.so`. |
 
 Both share an internal **`rhp`** crate — an RHPv2 client over loopback TCP
 `127.0.0.1:9000` (override with `PDN_RHP_ADDR`).
@@ -106,6 +106,16 @@ mock RHP server:
 * **Receive back-pressure**: inbound bytes are never silently dropped — a
   per-handle buffer plus a flusher thread drains into the socketpair as the app
   reads, without stalling the shared RHP reader thread.
+* **Connectionless UI** (`SOCK_DGRAM`): `socket → bind → sendto/recvfrom` maps to
+  RHP `socket{mode:dgram} → bind → sendto → recv`. `sendto` uses PID `0xF0` by
+  default (the beacon/APRS default), or strips the app's first byte as the PID
+  when `AX25_PIDINCL` is set (e.g. `0xCC` for IP-over-AX.25); inbound UI is
+  delivered whole through `recvfrom` with the source callsign filled, and all UI
+  heard on the bound port is seen (promiscuous, matching pdn's dgram RX).
+
+Worked examples of every one of these paths — using only the standard `AF_AX25`
+socket API — live in [`samples/`](samples/) (connected client/listener, UI
+beacon/monitor), with a "connected vs UI, when to use which" guide.
 
 Remaining `TODO(N1)` markers cover non-blocking niceties out of scope here (AX.25
 timer socket options captured as no-ops; connect-via-digipeater paths; the

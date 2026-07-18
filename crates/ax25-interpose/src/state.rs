@@ -27,6 +27,11 @@ pub struct FdState {
     pub remote: Option<String>,
     /// True once this fd is an RHP listener.
     pub listening: bool,
+    /// True if this is a connectionless UI socket (SOCK_DGRAM) rather than a
+    /// connected session (SOCK_SEQPACKET).
+    pub dgram: bool,
+    /// AX25_PIDINCL: the app prepends/consumes the PID byte itself (see lib.rs).
+    pub pidincl: bool,
     /// Captured AX.25 socket options (applied to a future OPEN where sensible).
     pub paclen: Option<u32>,
     pub window: Option<u32>,
@@ -337,9 +342,156 @@ fn nb_write(inner_fd: c_int, data: &[u8]) -> WriteOutcome {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Datagram pump: message-boundary-preserving delivery of inbound UI frames.
+//
+// A connected stream is a byte pipe, so RecvPump streams bytes into the
+// socketpair. A SOCK_DGRAM socket instead delivers discrete datagrams, each
+// carrying its source callsign and PID, which recvfrom() must return whole. So
+// we keep a per-handle queue of received datagrams in memory and use the
+// socketpair purely as a *readiness signal*: exactly one byte sits in the pipe
+// while the queue is non-empty, so real select/poll/blocking-read on the app fd
+// fire correctly, but the actual datagram (and its metadata) comes from the
+// queue. recvfrom() drains that signal byte when it removes the last datagram.
+// ----------------------------------------------------------------------------
+
+/// One received UI datagram awaiting `recvfrom`. The destination callsign the
+/// frame carried is not stored: the standard `recvfrom` API returns only the
+/// source address, and a bound socket's destination is its own bound callsign.
+pub struct Datagram {
+    pub source: Option<String>,
+    pub pid: Option<i64>,
+    pub data: Vec<u8>,
+}
+
+/// Result of a non-blocking datagram dequeue.
+pub enum DgramOutcome {
+    /// A datagram was dequeued.
+    Got(Datagram),
+    /// No datagram queued (caller should block or return EAGAIN).
+    Empty,
+    /// The transport is gone; report EOF.
+    Eof,
+    /// The handle is not registered (fd never bound/allocated).
+    NoHandle,
+}
+
+/// Cap on queued datagrams per socket. UI is lossy by nature; beyond this we
+/// drop the newest (as a full kernel socket buffer would) rather than grow
+/// without bound if the app never reads.
+const DGRAM_QUEUE_CAP: usize = 4096;
+
+struct DgramEntry {
+    app_fd: c_int,
+    inner_fd: c_int,
+    queue: VecDeque<Datagram>,
+    /// A readiness byte is currently sitting in the socketpair (queue non-empty).
+    signaled: bool,
+    /// Transport gone: report EOF once the queue drains.
+    eof: bool,
+}
+
+pub struct DgramPump {
+    state: Mutex<HashMap<u64, DgramEntry>>,
+}
+
+impl DgramPump {
+    fn new() -> DgramPump {
+        DgramPump { state: Mutex::new(HashMap::new()) }
+    }
+
+    /// Register a dgram handle's socketpair ends for delivery.
+    pub fn register(&self, handle: u64, app_fd: c_int, inner_fd: c_int) {
+        self.state.lock().unwrap().insert(
+            handle,
+            DgramEntry { app_fd, inner_fd, queue: VecDeque::new(), signaled: false, eof: false },
+        );
+    }
+
+    /// Forget a handle (its fd is being torn down).
+    pub fn unregister(&self, handle: u64) {
+        self.state.lock().unwrap().remove(&handle);
+    }
+
+    /// Raise the readiness signal for `e` if not already raised (>=1 unread byte
+    /// on the socketpair). Only ever writes when no byte is pending, so it can
+    /// never block the caller (invariant: 0 or 1 readiness byte in flight).
+    fn raise(e: &mut DgramEntry) {
+        if !e.signaled {
+            let send = real::send();
+            let b = [0u8; 1];
+            let n = unsafe {
+                send(e.inner_fd, b.as_ptr() as *const c_void, 1, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+            };
+            if n == 1 {
+                e.signaled = true;
+            }
+        }
+    }
+
+    /// Enqueue an inbound datagram and wake any reader. Called on the RHP reader
+    /// thread; never blocks it.
+    pub fn push(&self, handle: u64, dg: Datagram) {
+        let mut st = self.state.lock().unwrap();
+        let Some(e) = st.get_mut(&handle) else {
+            return; // fd already gone
+        };
+        if e.queue.len() >= DGRAM_QUEUE_CAP {
+            return; // buffer full: drop (UI is lossy)
+        }
+        e.queue.push_back(dg);
+        Self::raise(e);
+    }
+
+    /// Non-blocking dequeue of one datagram. Drains the socketpair readiness byte
+    /// when the queue empties so the app fd stops reporting readable.
+    pub fn recv_one(&self, handle: u64) -> DgramOutcome {
+        let mut st = self.state.lock().unwrap();
+        let Some(e) = st.get_mut(&handle) else {
+            return DgramOutcome::NoHandle;
+        };
+        if let Some(dg) = e.queue.pop_front() {
+            if e.queue.is_empty() && e.signaled {
+                // Consume the single readiness byte so app_fd goes non-readable.
+                let recv = real::recv();
+                let mut b = [0u8; 1];
+                unsafe {
+                    recv(e.app_fd, b.as_mut_ptr() as *mut c_void, 1, libc::MSG_DONTWAIT);
+                }
+                e.signaled = false;
+            }
+            return DgramOutcome::Got(dg);
+        }
+        if e.eof {
+            return DgramOutcome::Eof;
+        }
+        DgramOutcome::Empty
+    }
+
+    /// Transport gone: EOF every dgram handle and wake blocked readers.
+    pub fn shutdown_all(&self) {
+        let mut st = self.state.lock().unwrap();
+        for e in st.values_mut() {
+            e.eof = true;
+            Self::raise(e); // wake a blocked recvfrom so it can observe EOF
+        }
+    }
+}
+
+/// The shared datagram pump.
+pub fn dgram_pump() -> &'static DgramPump {
+    static M: OnceLock<DgramPump> = OnceLock::new();
+    M.get_or_init(DgramPump::new)
+}
+
 /// Is this fd one of ours (an AF_AX25 socket we created)?
 pub fn is_ax25_fd(fd: c_int) -> bool {
     fds().lock().unwrap().contains_key(&fd)
+}
+
+/// Is this fd one of ours AND a connectionless UI (SOCK_DGRAM) socket?
+pub fn is_dgram_fd(fd: c_int) -> bool {
+    fds().lock().unwrap().get(&fd).map(|s| s.dgram).unwrap_or(false)
 }
 
 /// Lazily connect (and cache) the shared RHP client. Returns None on failure.
@@ -363,7 +515,8 @@ pub fn ensure_client() -> Option<Arc<RhpClient>> {
 }
 
 /// Create a socketpair-backed AX.25 fd and register it. Returns the app fd.
-pub fn create_ax25_fd() -> Option<c_int> {
+/// `dgram` selects connectionless UI (SOCK_DGRAM) vs a connected session.
+pub fn create_ax25_fd(dgram: bool) -> Option<c_int> {
     let mut pair = [0 as c_int; 2];
     // socketpair is not interposed, so this calls real libc directly.
     let r = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) };
@@ -380,6 +533,8 @@ pub fn create_ax25_fd() -> Option<c_int> {
             local: None,
             remote: None,
             listening: false,
+            dgram,
+            pidincl: false,
             paclen: None,
             window: None,
         },
@@ -395,6 +550,7 @@ pub fn destroy_ax25_fd(fd: c_int) {
             // Remove pump/gate entries BEFORE closing the fd so the flusher can
             // never write to (or a reused) fd behind our back.
             recv_pump().unregister(h);
+            dgram_pump().unregister(h);
             connect_gates().lock().unwrap().remove(&h);
         }
         let close = real::close();
@@ -414,6 +570,17 @@ pub struct InterposeSink;
 impl RhpEventSink for InterposeSink {
     fn on_recv(&self, handle: u64, data: &[u8]) {
         recv_pump().push(handle, data);
+    }
+
+    fn on_dgram(
+        &self,
+        handle: u64,
+        source: Option<String>,
+        _dest: Option<String>,
+        pid: Option<i64>,
+        data: &[u8],
+    ) {
+        dgram_pump().push(handle, Datagram { source, pid, data: data.to_vec() });
     }
 
     fn on_status(&self, handle: u64, flags: i64) {
@@ -439,6 +606,7 @@ impl RhpEventSink for InterposeSink {
             resolve_connect_gate(h);
         }
         recv_pump().shutdown_all();
+        dgram_pump().shutdown_all();
     }
 }
 
