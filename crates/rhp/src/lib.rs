@@ -21,5 +21,8 @@ pub mod errors;
 pub mod framing;
 pub mod messages;
 
-pub use client::{BufferingSink, NullSink, OpenResult, RhpClient, RhpError, RhpEventSink};
+pub use client::{
+    AcceptInfo, BufferingSink, ConnPhase, NullSink, OpenResult, RhpClient, RhpError, RhpEventSink,
+};
 pub use errors::errcode_to_errno;
+pub use messages::STATUS_CONNECTED;

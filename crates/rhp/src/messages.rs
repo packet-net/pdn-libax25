@@ -16,6 +16,12 @@ pub const OPEN_FLAG_ACTIVE: u32 = 128;
 /// `flags:0` (Passive) — a listener.
 pub const OPEN_FLAG_PASSIVE: u32 = 0;
 
+/// RHP `status` StatusFlags: the link is up (SABM/UA complete). An outbound
+/// `open` (connect) reports success by a later async `status` push carrying this
+/// bit — the openReply alone only means the request was accepted, not that the
+/// AX.25 link came up.
+pub const STATUS_CONNECTED: i64 = 0x02;
+
 /// Max `send.data` characters per request (real xrouter drops sends above ~8KB).
 pub const MAX_SEND_CHUNK: usize = 8100;
 
@@ -145,6 +151,17 @@ impl Frame {
             .unwrap_or(0)
     }
 
+    /// StatusFlags on a `status` push. Real engines carry the bitfield in a
+    /// `flags` (or `status`) field; the interim plumbing reused `errCode`, so we
+    /// read `flags`/`status` first and fall back to `errCode` for compatibility.
+    pub fn status_flags(&self) -> i64 {
+        self.value
+            .get("flags")
+            .or_else(|| self.value.get("status"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| self.errcode())
+    }
+
     /// `errText`, reading both case variants.
     pub fn errtext(&self) -> Option<&str> {
         self.value
@@ -211,5 +228,18 @@ mod tests {
         assert_eq!(f.id(), None);
         assert_eq!(f.seqno(), Some(3));
         assert_eq!(f.data_str(), Some("hi"));
+    }
+
+    #[test]
+    fn status_flags_reads_flags_then_falls_back_to_errcode() {
+        // Explicit `flags` field wins.
+        let f = Frame::parse(br#"{"type":"status","handle":7,"flags":2}"#).unwrap();
+        assert_eq!(f.status_flags(), STATUS_CONNECTED);
+        // A `status` field is also honoured.
+        let f = Frame::parse(br#"{"type":"status","handle":7,"status":2}"#).unwrap();
+        assert_eq!(f.status_flags(), STATUS_CONNECTED);
+        // Legacy plumbing carried the bitfield in errCode.
+        let f = Frame::parse(br#"{"type":"status","handle":7,"errCode":2}"#).unwrap();
+        assert_eq!(f.status_flags(), STATUS_CONNECTED);
     }
 }

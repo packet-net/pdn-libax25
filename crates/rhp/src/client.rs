@@ -12,13 +12,21 @@
 // This mirrors the reference MIT client (rhp2lib-net RhpClient.cs) but is
 // synchronous with a thread instead of async/await, because it is driven from
 // libc-interposed calls that are themselves synchronous.
+//
+// Beyond the sink, the client keeps two internal registries so callers can wait
+// on asynchronous link events without racing the reader thread:
+//   * a per-handle *connect state* (Pending -> Connected / Failed), fed by the
+//     post-open `status`/`close` pushes — an outbound AX.25 connect is not
+//     complete on the openReply, only once a status(Connected) push arrives;
+//   * a per-listener *accept queue*, fed by `accept` pushes, so a blocking
+//     accept() can park on a condvar instead of busy-waiting.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::codec;
@@ -26,17 +34,22 @@ use crate::errors::errcode_to_errno;
 use crate::framing::{read_frame, write_frame};
 use crate::messages::{
     AuthReq, BindReq, CloseReq, Frame, ListenReq, OpenReq, SendReq, SocketReq, MAX_SEND_CHUNK,
-    OPEN_FLAG_ACTIVE, OPEN_FLAG_PASSIVE,
+    OPEN_FLAG_ACTIVE, OPEN_FLAG_PASSIVE, STATUS_CONNECTED,
 };
 
 /// Default request/reply timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Callbacks for asynchronous server pushes. Implemented by the interposer to
-/// wire RHP `recv` bytes into a socketpair, queue accepted children, etc.
+/// wire RHP `recv` bytes into a socketpair, react to link-state changes, etc.
 ///
 /// All methods are called from the single reader thread and must not block for
 /// long or re-enter the client with a request/reply call.
+///
+/// Note: `accept` pushes are ALSO queued internally (see [`RhpClient::wait_accept`])
+/// and the post-open connect transition is tracked internally (see
+/// [`RhpClient::wait_connected`]); the sink callbacks are additional hooks, not
+/// the source of truth for those two flows.
 pub trait RhpEventSink: Send + Sync {
     /// Inbound data on a connected handle.
     fn on_recv(&self, _handle: u64, _data: &[u8]) {}
@@ -104,13 +117,132 @@ pub struct OpenResult {
     pub errtext: Option<String>,
 }
 
+/// The link state of an outbound connect handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnPhase {
+    /// `open` accepted; awaiting the SABM/UA handshake (status(Connected)).
+    Pending,
+    /// The AX.25 link is up.
+    Connected,
+    /// The connect failed; carries the POSIX errno to report.
+    Failed(i32),
+}
+
+/// A pending inbound connection surfaced by an `accept` push.
+#[derive(Debug, Clone)]
+pub struct AcceptInfo {
+    /// The new child handle for the accepted connection.
+    pub child_handle: u64,
+    /// The remote (caller) callsign, if the engine reported one.
+    pub remote: Option<String>,
+    /// The local callsign the caller reached, if the engine reported one.
+    pub local: Option<String>,
+}
+
 type PendingMap = Arc<Mutex<HashMap<u64, mpsc::Sender<Frame>>>>;
+
+/// Per-handle connect-state registry, updated by the reader thread from
+/// post-open `status`/`close` pushes.
+#[derive(Default)]
+struct ConnRegistry {
+    map: Mutex<HashMap<u64, ConnPhase>>,
+    cv: Condvar,
+}
+
+impl ConnRegistry {
+    /// Arm tracking for a freshly-opened outbound handle. Never downgrades a
+    /// state a racing push already set (the status push can be processed before
+    /// `open_connect` returns).
+    fn set_pending(&self, handle: u64) {
+        self.map.lock().unwrap().entry(handle).or_insert(ConnPhase::Pending);
+    }
+
+    fn mark_connected(&self, handle: u64) {
+        self.map.lock().unwrap().insert(handle, ConnPhase::Connected);
+        self.cv.notify_all();
+    }
+
+    /// Fail a still-pending connect. A close on an already-Connected handle is a
+    /// normal EOF, not a connect failure, so we only transition from Pending.
+    fn mark_failed(&self, handle: u64, errno: i32) {
+        {
+            let mut m = self.map.lock().unwrap();
+            if let Some(p) = m.get_mut(&handle) {
+                if *p == ConnPhase::Pending {
+                    *p = ConnPhase::Failed(errno);
+                }
+            }
+        }
+        self.cv.notify_all();
+    }
+
+    /// Transport went away: fault every in-flight connect so waiters wake.
+    fn fail_all_pending(&self, errno: i32) {
+        {
+            let mut m = self.map.lock().unwrap();
+            for p in m.values_mut() {
+                if *p == ConnPhase::Pending {
+                    *p = ConnPhase::Failed(errno);
+                }
+            }
+        }
+        self.cv.notify_all();
+    }
+
+    fn result(&self, handle: u64) -> Option<Result<(), i32>> {
+        match self.map.lock().unwrap().get(&handle) {
+            Some(ConnPhase::Connected) => Some(Ok(())),
+            Some(ConnPhase::Failed(e)) => Some(Err(*e)),
+            _ => None,
+        }
+    }
+
+    /// Read-and-clear the pending connect error (SO_ERROR semantics): returns
+    /// the errno once, then reports success on subsequent reads.
+    fn take_error(&self, handle: u64) -> i32 {
+        let mut m = self.map.lock().unwrap();
+        match m.get_mut(&handle) {
+            Some(p) => {
+                let e = if let ConnPhase::Failed(x) = *p { x } else { 0 };
+                if e != 0 {
+                    *p = ConnPhase::Connected;
+                }
+                e
+            }
+            None => 0,
+        }
+    }
+
+    fn forget(&self, handle: u64) {
+        self.map.lock().unwrap().remove(&handle);
+    }
+}
+
+/// Per-listener queue of accepted children, updated by the reader thread.
+#[derive(Default)]
+struct AcceptRegistry {
+    map: Mutex<HashMap<u64, VecDeque<AcceptInfo>>>,
+    cv: Condvar,
+}
+
+impl AcceptRegistry {
+    fn push(&self, listener: u64, info: AcceptInfo) {
+        self.map.lock().unwrap().entry(listener).or_default().push_back(info);
+        self.cv.notify_all();
+    }
+
+    fn forget(&self, listener: u64) {
+        self.map.lock().unwrap().remove(&listener);
+    }
+}
 
 /// A live RHPv2 client connection.
 pub struct RhpClient {
     writer: Mutex<TcpStream>,
     next_id: AtomicU64,
     pending: PendingMap,
+    conns: Arc<ConnRegistry>,
+    accepts: Arc<AcceptRegistry>,
     closed: Arc<AtomicBool>,
     timeout: Duration,
     _sink: Arc<dyn RhpEventSink>,
@@ -139,16 +271,20 @@ impl RhpClient {
         let read_half = stream.try_clone()?;
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let conns: Arc<ConnRegistry> = Arc::new(ConnRegistry::default());
+        let accepts: Arc<AcceptRegistry> = Arc::new(AcceptRegistry::default());
         let closed = Arc::new(AtomicBool::new(false));
 
         // Reader thread: demux id-matched replies vs async pushes.
         {
             let pending = pending.clone();
+            let conns = conns.clone();
+            let accepts = accepts.clone();
             let closed = closed.clone();
             let sink = sink.clone();
             std::thread::Builder::new()
                 .name("rhp-reader".into())
-                .spawn(move || reader_loop(read_half, pending, closed, sink))
+                .spawn(move || reader_loop(read_half, pending, conns, accepts, closed, sink))
                 .map_err(RhpError::Io)?;
         }
 
@@ -156,6 +292,8 @@ impl RhpClient {
             writer: Mutex::new(stream),
             next_id: AtomicU64::new(0),
             pending,
+            conns,
+            accepts,
             closed,
             timeout: DEFAULT_TIMEOUT,
             _sink: sink,
@@ -240,8 +378,15 @@ impl RhpClient {
     }
 
     /// Outbound connect: `open` with `flags:128` (Active). Returns the handle.
+    ///
+    /// A successful return means only that the engine accepted the `open` — the
+    /// AX.25 link is not up yet. The handle is registered as [`ConnPhase::Pending`];
+    /// callers must [`wait_connected`](Self::wait_connected) (or poll
+    /// [`connect_result`](Self::connect_result)) for the SABM/UA handshake.
     pub fn open_connect(&self, local: &str, remote: &str) -> Result<OpenResult, RhpError> {
-        self.open(local, Some(remote), OPEN_FLAG_ACTIVE)
+        let res = self.open(local, Some(remote), OPEN_FLAG_ACTIVE)?;
+        self.conns.set_pending(res.handle);
+        Ok(res)
     }
 
     /// Passive listener open (no remote, `flags:0`).
@@ -275,6 +420,52 @@ impl RhpClient {
         })
     }
 
+    /// Block until an outbound connect handle reaches a terminal state.
+    ///
+    /// Returns `Ok(())` once a status(Connected) push arrives, or `Err(errno)`
+    /// if the connect failed (a `close` push, or the transport dropping). With
+    /// `timeout = None` this blocks until resolved or the transport dies; with
+    /// `Some(d)` it gives up after `d` and returns `Err(ETIMEDOUT)`.
+    pub fn wait_connected(&self, handle: u64, timeout: Option<Duration>) -> Result<(), i32> {
+        let mut m = self.conns.map.lock().unwrap();
+        loop {
+            match m.get(&handle) {
+                Some(ConnPhase::Connected) => return Ok(()),
+                Some(ConnPhase::Failed(e)) => return Err(*e),
+                _ => {}
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(libc::ECONNRESET);
+            }
+            m = match timeout {
+                None => self.conns.cv.wait(m).unwrap(),
+                Some(d) => {
+                    let (mm, res) = self.conns.cv.wait_timeout(m, d).unwrap();
+                    if res.timed_out() {
+                        return match mm.get(&handle) {
+                            Some(ConnPhase::Connected) => Ok(()),
+                            Some(ConnPhase::Failed(e)) => Err(*e),
+                            _ => Err(libc::ETIMEDOUT),
+                        };
+                    }
+                    mm
+                }
+            };
+        }
+    }
+
+    /// Non-blocking peek at an outbound connect's outcome: `None` while pending,
+    /// `Some(Ok)` once connected, `Some(Err(errno))` once failed.
+    pub fn connect_result(&self, handle: u64) -> Option<Result<(), i32>> {
+        self.conns.result(handle)
+    }
+
+    /// Read-and-clear the pending connect error for SO_ERROR: returns the errno
+    /// once (0 if connected/pending), then 0 on subsequent reads.
+    pub fn take_connect_error(&self, handle: u64) -> i32 {
+        self.conns.take_error(handle)
+    }
+
     /// Send data on a connected handle, chunking to <= MAX_SEND_CHUNK bytes.
     pub fn send(&self, handle: u64, data: &[u8]) -> Result<(), RhpError> {
         if data.is_empty() {
@@ -295,8 +486,10 @@ impl RhpClient {
         Self::check_ok(&reply)
     }
 
-    /// Close a handle.
+    /// Close a handle. Also drops any connect-state / accept-queue entries.
     pub fn close(&self, handle: u64) -> Result<(), RhpError> {
+        self.conns.forget(handle);
+        self.accepts.forget(handle);
         let id = self.next_id();
         let req = CloseReq { typ: "close", id, handle };
         let bytes = serde_json::to_vec(&req).map_err(json_io)?;
@@ -336,6 +529,40 @@ impl RhpClient {
         let reply = self.request(id, &bytes)?;
         Self::check_ok(&reply)
     }
+
+    /// Block until an inbound connection is accepted on `listener`.
+    ///
+    /// Returns `Some(info)` for the next queued `accept` push, or `None` if the
+    /// transport dropped (or the timeout elapsed). With `timeout = None` this
+    /// blocks indefinitely; with `Some(d)` it returns `None` after `d`.
+    pub fn wait_accept(&self, listener: u64, timeout: Option<Duration>) -> Option<AcceptInfo> {
+        let mut m = self.accepts.map.lock().unwrap();
+        loop {
+            if let Some(q) = m.get_mut(&listener) {
+                if let Some(info) = q.pop_front() {
+                    return Some(info);
+                }
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                return None;
+            }
+            m = match timeout {
+                None => self.accepts.cv.wait(m).unwrap(),
+                Some(d) => {
+                    let (mut mm, res) = self.accepts.cv.wait_timeout(m, d).unwrap();
+                    if res.timed_out() {
+                        return mm.get_mut(&listener).and_then(|q| q.pop_front());
+                    }
+                    mm
+                }
+            };
+        }
+    }
+
+    /// Non-blocking accept: pop the next queued child, or `None` if none waiting.
+    pub fn try_accept(&self, listener: u64) -> Option<AcceptInfo> {
+        self.accepts.map.lock().unwrap().get_mut(&listener).and_then(|q| q.pop_front())
+    }
 }
 
 /// Wrap a serde_json error as an RhpError::Io (serialisation cannot really fail
@@ -347,6 +574,8 @@ fn json_io(e: serde_json::Error) -> RhpError {
 fn reader_loop(
     mut stream: TcpStream,
     pending: PendingMap,
+    conns: Arc<ConnRegistry>,
+    accepts: Arc<AcceptRegistry>,
     closed: Arc<AtomicBool>,
     sink: Arc<dyn RhpEventSink>,
 ) {
@@ -368,7 +597,7 @@ fn reader_loop(
                     // id present but unknown: fall through to push dispatch.
                 }
 
-                dispatch_push(&frame, &sink);
+                dispatch_push(&frame, &conns, &accepts, &sink);
             }
             Err(_) => break,               // transport error
         }
@@ -377,10 +606,18 @@ fn reader_loop(
     closed.store(true, Ordering::SeqCst);
     // Fault any in-flight requests so their callers stop waiting.
     pending.lock().unwrap().clear();
+    // Fault in-flight connects and wake blocked accepts.
+    conns.fail_all_pending(libc::ECONNRESET);
+    accepts.cv.notify_all();
     sink.on_disconnect();
 }
 
-fn dispatch_push(frame: &Frame, sink: &Arc<dyn RhpEventSink>) {
+fn dispatch_push(
+    frame: &Frame,
+    conns: &Arc<ConnRegistry>,
+    accepts: &Arc<AcceptRegistry>,
+    sink: &Arc<dyn RhpEventSink>,
+) {
     match frame.typ() {
         "recv" => {
             if let Some(h) = frame.handle() {
@@ -390,22 +627,35 @@ fn dispatch_push(frame: &Frame, sink: &Arc<dyn RhpEventSink>) {
         }
         "accept" => {
             if let (Some(listener), Some(child)) = (frame.handle(), frame.child()) {
-                sink.on_accept(
+                let remote = frame.remote().map(|s| s.to_string());
+                let local = frame.local().map(|s| s.to_string());
+                accepts.push(
                     listener,
-                    child,
-                    frame.remote().map(|s| s.to_string()),
-                    frame.local().map(|s| s.to_string()),
+                    AcceptInfo { child_handle: child, remote: remote.clone(), local: local.clone() },
                 );
+                sink.on_accept(listener, child, remote, local);
             }
         }
         "status" => {
             if let Some(h) = frame.handle() {
-                sink.on_status(h, frame.errcode());
+                let flags = frame.status_flags();
+                if flags & STATUS_CONNECTED != 0 {
+                    conns.mark_connected(h);
+                }
+                sink.on_status(h, flags);
             }
         }
         "close" => {
-            // Server-initiated close (no id) == EOF.
+            // Server-initiated close (no id) == EOF, or a connect that failed
+            // before the link came up. When the close carries a reason (errCode),
+            // surface that errno; otherwise a bare close during connect is a
+            // refusal (DM / busy / SABM timeout).
             if let Some(h) = frame.handle() {
+                let errno = match frame.errcode() {
+                    0 => libc::ECONNREFUSED,
+                    code => errcode_to_errno(code),
+                };
+                conns.mark_failed(h, errno);
                 sink.on_close(h);
             }
         }
@@ -540,5 +790,157 @@ mod tests {
         let client = RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap();
         let err = client.open_connect("M0LTE", "GB7RDG").unwrap_err();
         assert_eq!(err.to_errno(), libc::EAFNOSUPPORT);
+    }
+
+    #[test]
+    fn connect_completes_only_after_status_connected_push() {
+        // The mock accepts the open, then sleeps before sending status(Connected).
+        // We prove the handle stays Pending until that push, then flips Connected.
+        let addr = spawn_mock(|mut sock| {
+            let req = read_frame(&mut sock).unwrap().unwrap();
+            let id = Frame::parse(&req).unwrap().id().unwrap();
+            let reply =
+                format!(r#"{{"type":"openReply","id":{id},"handle":5,"errCode":0,"errText":"Ok"}}"#);
+            write_frame(&mut sock, reply.as_bytes()).unwrap();
+            sock.flush().unwrap();
+            // Link handshake takes time.
+            std::thread::sleep(Duration::from_millis(150));
+            write_frame(&mut sock, br#"{"type":"status","handle":5,"flags":2}"#).unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        let client = Arc::new(RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap());
+        let res = client.open_connect("M0LTE", "GB7RDG").unwrap();
+        assert_eq!(res.handle, 5);
+
+        // openReply alone must NOT count as connected.
+        assert_eq!(client.connect_result(5), None, "connected on openReply alone");
+
+        // Block until connected; prove we actually waited for the push.
+        let start = std::time::Instant::now();
+        let outcome = client.wait_connected(5, Some(Duration::from_secs(5)));
+        assert_eq!(outcome, Ok(()));
+        assert!(
+            start.elapsed() >= Duration::from_millis(120),
+            "wait_connected returned before the status push arrived"
+        );
+        assert_eq!(client.connect_result(5), Some(Ok(())));
+    }
+
+    #[test]
+    fn connect_fails_on_close_push() {
+        let addr = spawn_mock(|mut sock| {
+            let req = read_frame(&mut sock).unwrap().unwrap();
+            let id = Frame::parse(&req).unwrap().id().unwrap();
+            let reply =
+                format!(r#"{{"type":"openReply","id":{id},"handle":9,"errCode":0,"errText":"Ok"}}"#);
+            write_frame(&mut sock, reply.as_bytes()).unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+            // Link never came up: the engine closes the handle (e.g. DM / busy).
+            write_frame(&mut sock, br#"{"type":"close","handle":9}"#).unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+        });
+
+        let client = RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap();
+        let res = client.open_connect("M0LTE", "GB7RDG").unwrap();
+        assert_eq!(res.handle, 9);
+
+        let outcome = client.wait_connected(9, Some(Duration::from_secs(5)));
+        assert_eq!(outcome, Err(libc::ECONNREFUSED));
+        // SO_ERROR drain: reports the errno once, then 0.
+        assert_eq!(client.take_connect_error(9), libc::ECONNREFUSED);
+        assert_eq!(client.take_connect_error(9), 0);
+    }
+
+    #[test]
+    fn connect_failure_uses_close_reason_errcode() {
+        // A close push carrying an errCode should surface that specific errno,
+        // not the generic ECONNREFUSED.
+        let addr = spawn_mock(|mut sock| {
+            let req = read_frame(&mut sock).unwrap().unwrap();
+            let id = Frame::parse(&req).unwrap().id().unwrap();
+            let reply =
+                format!(r#"{{"type":"openReply","id":{id},"handle":4,"errCode":0,"errText":"Ok"}}"#);
+            write_frame(&mut sock, reply.as_bytes()).unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+            // errCode 15 == No route == EHOSTUNREACH.
+            write_frame(&mut sock, br#"{"type":"close","handle":4,"errCode":15}"#).unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+        });
+
+        let client = RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap();
+        let res = client.open_connect("M0LTE", "GB7RDG").unwrap();
+        assert_eq!(res.handle, 4);
+        assert_eq!(
+            client.wait_connected(4, Some(Duration::from_secs(5))),
+            Err(libc::EHOSTUNREACH)
+        );
+    }
+
+    #[test]
+    fn accept_push_surfaces_child_with_peer_callsign() {
+        let addr = spawn_mock(|mut sock| {
+            // socket -> bind -> listen, each id-matched with a reply carrying the handle.
+            for _ in 0..3 {
+                let req = read_frame(&mut sock).unwrap().unwrap();
+                let f = Frame::parse(&req).unwrap();
+                let id = f.id().unwrap();
+                let reply = format!(
+                    r#"{{"type":"{}Reply","id":{id},"handle":3,"errCode":0,"errText":"Ok"}}"#,
+                    f.typ()
+                );
+                write_frame(&mut sock, reply.as_bytes()).unwrap();
+                sock.flush().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            // Inbound connection: an accept push naming the caller.
+            write_frame(
+                &mut sock,
+                br#"{"type":"accept","handle":3,"child":77,"remote":"M0ABC-2","local":"GB7RDG-1"}"#,
+            )
+            .unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        let client = RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap();
+        let h = client.socket().unwrap();
+        client.bind(h, "GB7RDG-1", None).unwrap();
+        client.listen(h).unwrap();
+
+        // Nothing queued yet.
+        assert!(client.try_accept(h).is_none());
+
+        let info = client.wait_accept(h, Some(Duration::from_secs(5))).expect("accept");
+        assert_eq!(info.child_handle, 77);
+        assert_eq!(info.remote.as_deref(), Some("M0ABC-2"));
+        assert_eq!(info.local.as_deref(), Some("GB7RDG-1"));
+    }
+
+    #[test]
+    fn transport_drop_faults_blocked_connect_and_accept() {
+        // The mock answers the open then hangs up; both waiters must unblock.
+        let addr = spawn_mock(|mut sock| {
+            let req = read_frame(&mut sock).unwrap().unwrap();
+            let id = Frame::parse(&req).unwrap().id().unwrap();
+            let reply =
+                format!(r#"{{"type":"openReply","id":{id},"handle":11,"errCode":0,"errText":"Ok"}}"#);
+            write_frame(&mut sock, reply.as_bytes()).unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+            // drop `sock` -> transport EOF
+        });
+
+        let client = RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap();
+        let res = client.open_connect("M0LTE", "GB7RDG").unwrap();
+        // Blocking connect wakes with an error when the transport dies.
+        assert!(client.wait_connected(res.handle, None).is_err());
+        // A blocking accept on some listener also wakes (returns None).
+        assert!(client.wait_accept(999, None).is_none());
     }
 }
