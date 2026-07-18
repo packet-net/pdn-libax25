@@ -1,0 +1,17 @@
+[package]
+name = "ax25-interpose"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LD_PRELOAD libc interposer routing AF_AX25 sockets to the pdn AX.25 stack over RHPv2."
+
+# Produces `libax25_interpose.so` (cargo prefixes `lib` and forbids `-` in lib
+# names). Use it via LD_PRELOAD directly, or symlink it to `ax25-interpose.so`.
+[lib]
+name = "ax25_interpose"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+rhp = { path = "../rhp" }
+libc.workspace = true

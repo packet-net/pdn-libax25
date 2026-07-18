@@ -1,0 +1,20 @@
+[package]
+name = "libax25"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Drop-in replacement for the ve7fet libax25 helper library, backed by the pdn AX.25 stack."
+
+# Produce `libax25.so` (the lib name is `ax25`, so cargo prefixes `lib`).
+# build.rs stamps the SONAME to `libax25.so.1` to match upstream's
+# libax25.so.1.0.1 / pkg 1.2.2. Apps linking `-lax25` resolve against this.
+[lib]
+name = "ax25"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+rhp = { path = "../rhp" }
+libc.workspace = true
+
+[build-dependencies]
