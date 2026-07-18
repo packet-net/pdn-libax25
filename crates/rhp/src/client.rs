@@ -33,8 +33,8 @@ use crate::codec;
 use crate::errors::errcode_to_errno;
 use crate::framing::{read_frame, write_frame};
 use crate::messages::{
-    AuthReq, BindReq, CloseReq, Frame, ListenReq, OpenReq, SendReq, SocketReq, MAX_SEND_CHUNK,
-    OPEN_FLAG_ACTIVE, OPEN_FLAG_PASSIVE, STATUS_CONNECTED,
+    AuthReq, BindReq, CloseReq, Frame, ListenReq, OpenReq, SendReq, SendToReq, SocketReq,
+    MAX_SEND_CHUNK, OPEN_FLAG_ACTIVE, OPEN_FLAG_PASSIVE, STATUS_CONNECTED,
 };
 
 /// Default request/reply timeout.
@@ -51,8 +51,21 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`RhpClient::wait_connected`]); the sink callbacks are additional hooks, not
 /// the source of truth for those two flows.
 pub trait RhpEventSink: Send + Sync {
-    /// Inbound data on a connected handle.
+    /// Inbound data on a connected (stream) handle.
     fn on_recv(&self, _handle: u64, _data: &[u8]) {}
+    /// An inbound connectionless UI datagram on a `dgram` handle. `source` is the
+    /// sender's callsign, `dest` the destination it was addressed to, `pid` the
+    /// AX.25 protocol-id byte. All UI heard on the bound port is delivered
+    /// (promiscuous), matching pdn's dgram RX.
+    fn on_dgram(
+        &self,
+        _handle: u64,
+        _source: Option<String>,
+        _dest: Option<String>,
+        _pid: Option<i64>,
+        _data: &[u8],
+    ) {
+    }
     /// A listener accepted an inbound connection (`child` is the new handle).
     fn on_accept(&self, _listener: u64, _child: u64, _remote: Option<String>, _local: Option<String>) {}
     /// Link-state change for a handle (RHP StatusFlags bitfield).
@@ -486,6 +499,26 @@ impl RhpClient {
         Self::check_ok(&reply)
     }
 
+    /// Send one connectionless UI datagram (`sendto`). `remote` is the
+    /// destination callsign, `local` the source (bound) callsign, `pid` the
+    /// AX.25 protocol-id byte (0xF0 for no-Layer-3). pdn rejects an empty
+    /// payload (errCode 1), so callers should filter that before calling.
+    pub fn sendto(
+        &self,
+        handle: u64,
+        remote: &str,
+        local: &str,
+        pid: Option<i64>,
+        data: &[u8],
+    ) -> Result<(), RhpError> {
+        let id = self.next_id();
+        let wire = codec::to_wire_string(data);
+        let req = SendToReq { typ: "sendto", id, handle, remote, local, pid, data: &wire };
+        let bytes = serde_json::to_vec(&req).map_err(json_io)?;
+        let reply = self.request(id, &bytes)?;
+        Self::check_ok(&reply)
+    }
+
     /// Close a handle. Also drops any connect-state / accept-queue entries.
     pub fn close(&self, handle: u64) -> Result<(), RhpError> {
         self.conns.forget(handle);
@@ -499,10 +532,19 @@ impl RhpClient {
 
     // ---- BSD-style listener path (socket/bind/listen) --------------------
 
-    /// Allocate a socket handle (`socket`).
+    /// Allocate a connected-stream socket handle (`socket`, mode `stream`).
     pub fn socket(&self) -> Result<u64, RhpError> {
+        self.socket_mode("stream")
+    }
+
+    /// Allocate a connectionless-UI socket handle (`socket`, mode `dgram`).
+    pub fn socket_dgram(&self) -> Result<u64, RhpError> {
+        self.socket_mode("dgram")
+    }
+
+    fn socket_mode(&self, mode: &str) -> Result<u64, RhpError> {
         let id = self.next_id();
-        let req = SocketReq { typ: "socket", id, pfam: "ax25", mode: "stream" };
+        let req = SocketReq { typ: "socket", id, pfam: "ax25", mode };
         let bytes = serde_json::to_vec(&req).map_err(json_io)?;
         let reply = self.request(id, &bytes)?;
         Self::check_ok(&reply)?;
@@ -622,7 +664,14 @@ fn dispatch_push(
         "recv" => {
             if let Some(h) = frame.handle() {
                 let data = frame.data_str().map(codec::from_wire_string).unwrap_or_default();
-                sink.on_recv(h, &data);
+                if frame.is_dgram_recv() {
+                    // Connectionless UI: carries source (remote), dest (local), pid.
+                    let source = frame.remote().map(|s| s.to_string());
+                    let dest = frame.local().map(|s| s.to_string());
+                    sink.on_dgram(h, source, dest, frame.pid(), &data);
+                } else {
+                    sink.on_recv(h, &data);
+                }
             }
         }
         "accept" => {
@@ -920,6 +969,92 @@ mod tests {
         assert_eq!(info.child_handle, 77);
         assert_eq!(info.remote.as_deref(), Some("M0ABC-2"));
         assert_eq!(info.local.as_deref(), Some("GB7RDG-1"));
+    }
+
+    #[test]
+    fn socket_dgram_requests_dgram_mode_and_sendto_carries_pid_data() {
+        // Capture the socket + sendto requests the client emits so we can assert
+        // the dgram mode and the sendto remote/local/pid/data.
+        let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_w = seen.clone();
+        let addr = spawn_mock(move |mut sock| {
+            for _ in 0..2 {
+                let req = read_frame(&mut sock).unwrap().unwrap();
+                let f = Frame::parse(&req).unwrap();
+                seen_w.lock().unwrap().push(f.value.clone());
+                let id = f.id().unwrap();
+                let reply = format!(
+                    r#"{{"type":"{}Reply","id":{id},"handle":21,"errCode":0,"errText":"Ok"}}"#,
+                    f.typ()
+                );
+                write_frame(&mut sock, reply.as_bytes()).unwrap();
+                sock.flush().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        let client = RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap();
+        let h = client.socket_dgram().unwrap();
+        assert_eq!(h, 21);
+        client.sendto(h, "BEACON", "M0LTE-2", Some(0xF0), b"de M0LTE").unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0]["type"], "socket");
+        assert_eq!(seen[0]["mode"], "dgram");
+        assert_eq!(seen[1]["type"], "sendto");
+        assert_eq!(seen[1]["remote"], "BEACON");
+        assert_eq!(seen[1]["local"], "M0LTE-2");
+        assert_eq!(seen[1]["pid"], 240);
+        assert_eq!(seen[1]["data"], "de M0LTE");
+    }
+
+    /// A sink that records the last dgram delivered (source/dest/pid/data).
+    #[derive(Default)]
+    struct DgramSink {
+        last: Mutex<Option<(Option<String>, Option<String>, Option<i64>, Vec<u8>)>>,
+    }
+    impl RhpEventSink for DgramSink {
+        fn on_dgram(
+            &self,
+            _handle: u64,
+            source: Option<String>,
+            dest: Option<String>,
+            pid: Option<i64>,
+            data: &[u8],
+        ) {
+            *self.last.lock().unwrap() = Some((source, dest, pid, data.to_vec()));
+        }
+    }
+
+    #[test]
+    fn dgram_recv_push_routes_to_on_dgram_with_source_and_pid() {
+        let addr = spawn_mock(|mut sock| {
+            let req = read_frame(&mut sock).unwrap().unwrap();
+            let id = Frame::parse(&req).unwrap().id().unwrap();
+            let reply = format!(
+                r#"{{"type":"socketReply","id":{id},"handle":8,"errCode":0,"errText":"Ok"}}"#
+            );
+            write_frame(&mut sock, reply.as_bytes()).unwrap();
+            // Inbound UI frame: source G0ABC-1 -> dest APRS, pid 0xF0, data "!pos".
+            write_frame(
+                &mut sock,
+                br#"{"type":"recv","handle":8,"remote":"G0ABC-1","local":"APRS","pid":240,"data":"!pos"}"#,
+            )
+            .unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+        });
+
+        let sink = Arc::new(DgramSink::default());
+        let client = RhpClient::connect_to(addr, sink.clone()).unwrap();
+        assert_eq!(client.socket_dgram().unwrap(), 8);
+        std::thread::sleep(Duration::from_millis(80));
+
+        let got = sink.last.lock().unwrap().clone().expect("dgram delivered");
+        assert_eq!(got.0.as_deref(), Some("G0ABC-1"));
+        assert_eq!(got.1.as_deref(), Some("APRS"));
+        assert_eq!(got.2, Some(240));
+        assert_eq!(got.3, b"!pos".to_vec());
     }
 
     #[test]

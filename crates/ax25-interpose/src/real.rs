@@ -46,6 +46,22 @@ pub type ReadFn = unsafe extern "C" fn(c_int, *mut c_void, size_t) -> ssize_t;
 pub type WriteFn = unsafe extern "C" fn(c_int, *const c_void, size_t) -> ssize_t;
 pub type RecvFn = unsafe extern "C" fn(c_int, *mut c_void, size_t, c_int) -> ssize_t;
 pub type SendFn = unsafe extern "C" fn(c_int, *const c_void, size_t, c_int) -> ssize_t;
+pub type RecvfromFn = unsafe extern "C" fn(
+    c_int,
+    *mut c_void,
+    size_t,
+    c_int,
+    *mut sockaddr,
+    *mut socklen_t,
+) -> ssize_t;
+pub type SendtoFn = unsafe extern "C" fn(
+    c_int,
+    *const c_void,
+    size_t,
+    c_int,
+    *const sockaddr,
+    socklen_t,
+) -> ssize_t;
 pub type SelectFn = unsafe extern "C" fn(
     c_int,
     *mut libc::fd_set,
@@ -69,6 +85,8 @@ real_fn!(read, "read", ReadFn);
 real_fn!(write, "write", WriteFn);
 real_fn!(recv, "recv", RecvFn);
 real_fn!(send, "send", SendFn);
+real_fn!(recvfrom, "recvfrom", RecvfromFn);
+real_fn!(sendto, "sendto", SendtoFn);
 real_fn!(select, "select", SelectFn);
 real_fn!(poll, "poll", PollFn);
 real_fn!(close, "close", CloseFn);

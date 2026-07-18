@@ -32,13 +32,21 @@ mod addr;
 mod real;
 mod state;
 
-use addr::{AF_AX25, SOCK_SEQPACKET, SOL_AX25};
+use addr::{AF_AX25, SOCK_DGRAM, SOCK_SEQPACKET, SOL_AX25};
 use libc::{c_int, c_void, size_t, sockaddr, socklen_t, ssize_t};
+use state::DgramOutcome;
 use std::time::Duration;
 
 // AX.25 setsockopt option names we care about (from <netax25/ax25.h>).
 const AX25_WINDOW: c_int = 1;
 const AX25_PACLEN: c_int = 10;
+/// AX25_PIDINCL (option 8): when set, the app's buffer carries the AX.25 PID as
+/// its first byte on send, and recv prepends the PID byte — the kernel AF_AX25
+/// convention used to send e.g. IP (PID 0xCC) over a datagram socket.
+const AX25_PIDINCL: c_int = 8;
+
+/// Default AX.25 PID for UI frames: 0xF0 = "no Layer 3", the beacon/APRS default.
+const AX25_PID_NO_L3: i64 = 0xF0;
 
 /// How long a blocking connect() waits for the AX.25 SABM/UA handshake before
 /// giving up with ETIMEDOUT. Generous, because SABM is retried (T1 * N2) and a
@@ -67,8 +75,9 @@ unsafe fn set_errno(e: c_int) {
 pub unsafe extern "C" fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int {
     // Mask CLOEXEC/NONBLOCK flags before comparing the socket type.
     let base = ty & !(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK);
-    if domain == AF_AX25 && base == SOCK_SEQPACKET {
-        match state::create_ax25_fd() {
+    if domain == AF_AX25 && (base == SOCK_SEQPACKET || base == SOCK_DGRAM) {
+        // SOCK_SEQPACKET -> connected session; SOCK_DGRAM -> connectionless UI.
+        match state::create_ax25_fd(base == SOCK_DGRAM) {
             Some(fd) => return fd,
             None => {
                 set_errno(libc::ENFILE);
@@ -80,17 +89,33 @@ pub unsafe extern "C" fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_
 }
 
 /// `int bind(int fd, const struct sockaddr *addr, socklen_t len)`.
+///
+/// For a connected (SEQPACKET) socket this just records the local callsign for a
+/// later connect/listen. For a connectionless (DGRAM/UI) socket it eagerly opens
+/// the RHP `dgram` handle and binds the callsign (port null = all ports), so the
+/// engine starts delivering inbound UI on that port to us.
 #[no_mangle]
 pub unsafe extern "C" fn bind(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
-    if state::is_ax25_fd(fd) {
-        if let Some(call) = addr::read_call(addr, len) {
-            if let Some(s) = state::fds().lock().unwrap().get_mut(&fd) {
-                s.local = Some(call);
-            }
-        }
-        return 0;
+    if !state::is_ax25_fd(fd) {
+        return real::bind()(fd, addr, len);
     }
-    real::bind()(fd, addr, len)
+    let call = addr::read_call(addr, len);
+    if let Some(call) = &call {
+        if let Some(s) = state::fds().lock().unwrap().get_mut(&fd) {
+            s.local = Some(call.clone());
+        }
+    }
+    if state::is_dgram_fd(fd) {
+        // Open + bind the dgram handle now so RX starts flowing.
+        return match ensure_dgram_handle(fd) {
+            Ok(_) => 0,
+            Err(errno) => {
+                set_errno(errno);
+                -1
+            }
+        };
+    }
+    0
 }
 
 /// `int listen(int fd, int backlog)`.
@@ -143,6 +168,21 @@ pub unsafe extern "C" fn connect(fd: c_int, addr: *const sockaddr, len: socklen_
         set_errno(libc::EINVAL);
         return -1;
     };
+
+    // A connect() on a connectionless UI socket has no handshake: it only records
+    // a default destination so plain send()/write() (with no explicit dest) know
+    // where to go. Make sure the dgram handle exists, then store the remote.
+    if state::is_dgram_fd(fd) {
+        if let Err(errno) = ensure_dgram_handle(fd) {
+            set_errno(errno);
+            return -1;
+        }
+        if let Some(s) = state::fds().lock().unwrap().get_mut(&fd) {
+            s.remote = Some(remote);
+        }
+        return 0;
+    }
+
     let local = state::fds()
         .lock()
         .unwrap()
@@ -258,7 +298,7 @@ pub unsafe extern "C" fn accept(fd: c_int, addr: *mut sockaddr, len: *mut sockle
         }
     };
 
-    let Some(child_fd) = state::create_ax25_fd() else {
+    let Some(child_fd) = state::create_ax25_fd(false) else {
         set_errno(libc::ENFILE);
         return -1;
     };
@@ -342,6 +382,7 @@ pub unsafe extern "C" fn setsockopt(
                 match optname {
                     AX25_WINDOW => s.window = Some(v),
                     AX25_PACLEN => s.paclen = Some(v),
+                    AX25_PIDINCL => s.pidincl = v != 0,
                     _ => { /* T1/T2/T3/N2/EXTSEQ/... captured as no-ops (TODO(N1)) */ }
                 }
             }
@@ -400,24 +441,69 @@ pub unsafe extern "C" fn getsockopt(
 
 /// `ssize_t read(int fd, void *buf, size_t count)`.
 ///
-/// For AX.25 fds the inbound bytes are already in the socketpair (the reader
-/// thread wrote them to our end), so a plain real read serves them.
+/// For a connected AX.25 fd the inbound bytes are already in the socketpair (the
+/// reader thread wrote them to our end), so a plain real read serves them. A
+/// dgram fd delivers one whole datagram from the datagram pump instead.
 #[no_mangle]
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t {
+    if state::is_dgram_fd(fd) {
+        return ax25_dgram_recv(fd, buf, count, 0, std::ptr::null_mut(), std::ptr::null_mut());
+    }
     real::read()(fd, buf, count)
 }
 
 /// `ssize_t recv(int fd, void *buf, size_t len, int flags)`.
 #[no_mangle]
 pub unsafe extern "C" fn recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -> ssize_t {
-    // Our AX.25 fd is a real socketpair socket, so recv() (incl. MSG_PEEK) works
-    // against it directly.
+    if state::is_dgram_fd(fd) {
+        // recv() is recvfrom() with a NULL source address.
+        return recvfrom(fd, buf, len, flags, std::ptr::null_mut(), std::ptr::null_mut());
+    }
+    // A connected AX.25 fd is a real socketpair socket, so recv() (incl.
+    // MSG_PEEK) works against it directly.
     real::recv()(fd, buf, len, flags)
+}
+
+/// `ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
+///                   struct sockaddr *src, socklen_t *srclen)`.
+///
+/// For a dgram fd this returns one whole UI datagram and fills `src` with the
+/// sender's callsign. For a connected fd it behaves like recv() (bytes from the
+/// socketpair), filling `src` with the peer callsign if asked.
+#[no_mangle]
+pub unsafe extern "C" fn recvfrom(
+    fd: c_int,
+    buf: *mut c_void,
+    len: size_t,
+    flags: c_int,
+    src: *mut sockaddr,
+    srclen: *mut socklen_t,
+) -> ssize_t {
+    if state::is_dgram_fd(fd) {
+        return ax25_dgram_recv(fd, buf, len, flags, src, srclen);
+    }
+    if state::is_ax25_fd(fd) {
+        // Connected AX.25 socket: bytes are in the socketpair. Fill the peer
+        // callsign for callers that pass a source buffer.
+        let n = real::recv()(fd, buf, len, flags);
+        if n >= 0 && !src.is_null() {
+            let remote = state::fds().lock().unwrap().get(&fd).and_then(|s| s.remote.clone());
+            if let Some(remote) = remote {
+                addr::write_call(src, srclen, &remote);
+            }
+        }
+        return n;
+    }
+    real::recvfrom()(fd, buf, len, flags, src, srclen)
 }
 
 /// `ssize_t write(int fd, const void *buf, size_t count)`.
 #[no_mangle]
 pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
+    if state::is_dgram_fd(fd) {
+        // write() on a dgram socket sends to the connected default remote.
+        return ax25_dgram_send(fd, buf, count, std::ptr::null(), 0);
+    }
     if state::is_ax25_fd(fd) {
         return ax25_send(fd, buf, count);
     }
@@ -427,10 +513,38 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: size_t) -> 
 /// `ssize_t send(int fd, const void *buf, size_t len, int flags)`.
 #[no_mangle]
 pub unsafe extern "C" fn send(fd: c_int, buf: *const c_void, len: size_t, flags: c_int) -> ssize_t {
+    if state::is_dgram_fd(fd) {
+        return ax25_dgram_send(fd, buf, len, std::ptr::null(), 0);
+    }
     if state::is_ax25_fd(fd) {
         return ax25_send(fd, buf, len);
     }
     real::send()(fd, buf, len, flags)
+}
+
+/// `ssize_t sendto(int fd, const void *buf, size_t len, int flags,
+///                 const struct sockaddr *dest, socklen_t destlen)`.
+///
+/// The datagram send path: for a dgram fd, sends one UI frame to the callsign in
+/// `dest` (or the connected default remote if `dest` is NULL). A connected fd
+/// ignores `dest` and behaves like send().
+#[no_mangle]
+pub unsafe extern "C" fn sendto(
+    fd: c_int,
+    buf: *const c_void,
+    len: size_t,
+    flags: c_int,
+    dest: *const sockaddr,
+    destlen: socklen_t,
+) -> ssize_t {
+    if state::is_dgram_fd(fd) {
+        return ax25_dgram_send(fd, buf, len, dest, destlen);
+    }
+    if state::is_ax25_fd(fd) {
+        // Connected socket: sendto's destination is ignored (already connected).
+        return ax25_send(fd, buf, len);
+    }
+    real::sendto()(fd, buf, len, flags, dest, destlen)
 }
 
 unsafe fn ax25_send(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
@@ -449,6 +563,205 @@ unsafe fn ax25_send(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
         Err(e) => {
             set_errno(e.to_errno());
             -1
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Connectionless UI (SOCK_DGRAM) helpers.
+// ----------------------------------------------------------------------------
+
+/// Ensure a dgram fd has an RHP `dgram` handle (opening + binding it on first
+/// use), registered with the datagram pump for RX. Returns the handle or an
+/// errno. Idempotent: a second call just returns the existing handle.
+unsafe fn ensure_dgram_handle(fd: c_int) -> Result<u64, c_int> {
+    // Fast path: handle already allocated.
+    let local = {
+        let g = state::fds().lock().unwrap();
+        match g.get(&fd) {
+            Some(s) => {
+                if let Some(h) = s.handle {
+                    return Ok(h);
+                }
+                s.local.clone()
+            }
+            None => return Err(libc::EBADF),
+        }
+    };
+
+    let Some(client) = state::ensure_client() else {
+        return Err(libc::ECONNREFUSED);
+    };
+    let handle = client.socket_dgram().map_err(|e| e.to_errno())?;
+    // Bind the local callsign so the engine delivers inbound UI to us. port=None
+    // (all ports). An unbound socket (no local yet) can still send.
+    if let Some(local) = &local {
+        if let Err(e) = client.bind(handle, local, None) {
+            let _ = client.close(handle);
+            return Err(e.to_errno());
+        }
+    }
+
+    // Store the handle and register for RX. Guard against a racing caller having
+    // set one already (single-threaded apps never hit this).
+    let (app_fd, inner_fd, existing) = {
+        let mut g = state::fds().lock().unwrap();
+        let Some(s) = g.get_mut(&fd) else {
+            let _ = client.close(handle);
+            return Err(libc::EBADF);
+        };
+        match s.handle {
+            Some(h) => (s.app_fd, s.inner_fd, Some(h)),
+            None => {
+                s.handle = Some(handle);
+                (s.app_fd, s.inner_fd, None)
+            }
+        }
+    };
+    match existing {
+        Some(h) => {
+            let _ = client.close(handle); // lost the race; discard our handle
+            Ok(h)
+        }
+        None => {
+            state::dgram_pump().register(handle, app_fd, inner_fd);
+            Ok(handle)
+        }
+    }
+}
+
+/// Send one UI frame. `dest` (if non-NULL) is the destination sockaddr; else the
+/// connected default remote is used. Applies the AX25_PIDINCL convention.
+unsafe fn ax25_dgram_send(
+    fd: c_int,
+    buf: *const c_void,
+    count: size_t,
+    dest: *const sockaddr,
+    destlen: socklen_t,
+) -> ssize_t {
+    let handle = match ensure_dgram_handle(fd) {
+        Ok(h) => h,
+        Err(e) => {
+            set_errno(e);
+            return -1;
+        }
+    };
+    let (default_remote, local, pidincl) = {
+        let g = state::fds().lock().unwrap();
+        match g.get(&fd) {
+            Some(s) => (s.remote.clone(), s.local.clone(), s.pidincl),
+            None => {
+                set_errno(libc::EBADF);
+                return -1;
+            }
+        }
+    };
+
+    // Destination: an explicit sendto() address, else the connect()ed remote.
+    let remote = if !dest.is_null() {
+        match addr::read_call(dest, destlen) {
+            Some(r) => r,
+            None => {
+                set_errno(libc::EINVAL);
+                return -1;
+            }
+        }
+    } else {
+        match default_remote {
+            Some(r) => r,
+            None => {
+                set_errno(libc::EDESTADDRREQ);
+                return -1;
+            }
+        }
+    };
+    let local = local
+        .or_else(|| std::env::var("AX25_SRC_CALL").ok())
+        .unwrap_or_else(|| "NOCALL".to_string());
+
+    // PID handling: default 0xF0, unless AX25_PIDINCL means byte 0 is the PID.
+    let app = std::slice::from_raw_parts(buf as *const u8, count);
+    let (pid, data): (i64, &[u8]) = if pidincl {
+        if app.is_empty() {
+            set_errno(libc::EINVAL); // no room even for the PID byte
+            return -1;
+        }
+        (app[0] as i64, &app[1..])
+    } else {
+        (AX25_PID_NO_L3, app)
+    };
+    if data.is_empty() {
+        // pdn rejects an empty AX.25 UI frame (errCode 1); fail locally.
+        set_errno(libc::EINVAL);
+        return -1;
+    }
+
+    let Some(client) = state::ensure_client() else {
+        set_errno(libc::EIO);
+        return -1;
+    };
+    match client.sendto(handle, &remote, &local, Some(pid), data) {
+        // Report the whole app buffer consumed (incl. the PID byte if PIDINCL).
+        Ok(()) => count as ssize_t,
+        Err(e) => {
+            set_errno(e.to_errno());
+            -1
+        }
+    }
+}
+
+/// Receive one UI datagram from the datagram pump, filling `src` with the sender
+/// callsign. Blocks (honouring O_NONBLOCK / MSG_DONTWAIT) until one arrives.
+unsafe fn ax25_dgram_recv(
+    fd: c_int,
+    buf: *mut c_void,
+    len: size_t,
+    flags: c_int,
+    src: *mut sockaddr,
+    srclen: *mut socklen_t,
+) -> ssize_t {
+    let handle = match ensure_dgram_handle(fd) {
+        Ok(h) => h,
+        Err(e) => {
+            set_errno(e);
+            return -1;
+        }
+    };
+    let pidincl = state::fds().lock().unwrap().get(&fd).map(|s| s.pidincl).unwrap_or(false);
+    let nonblock = is_nonblocking(fd) || (flags & libc::MSG_DONTWAIT) != 0;
+
+    loop {
+        match state::dgram_pump().recv_one(handle) {
+            DgramOutcome::Got(dg) => {
+                // Assemble the returned payload, PID byte first if PIDINCL.
+                let mut out: Vec<u8> = Vec::with_capacity(dg.data.len() + 1);
+                if pidincl {
+                    out.push((dg.pid.unwrap_or(AX25_PID_NO_L3) & 0xFF) as u8);
+                }
+                out.extend_from_slice(&dg.data);
+                let n = out.len().min(len); // datagram truncated to the buffer
+                if n > 0 {
+                    std::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, n);
+                }
+                if !src.is_null() {
+                    addr::write_call(src, srclen, dg.source.as_deref().unwrap_or(""));
+                }
+                return n as ssize_t;
+            }
+            DgramOutcome::Eof => return 0,
+            DgramOutcome::NoHandle => {
+                set_errno(libc::ENOTCONN);
+                return -1;
+            }
+            DgramOutcome::Empty => {
+                if nonblock {
+                    set_errno(libc::EAGAIN);
+                    return -1;
+                }
+                // Park on the socketpair readiness signal, then retry the queue.
+                let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                real::poll()(&mut pfd, 1, -1);
+            }
         }
     }
 }
@@ -514,8 +827,11 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
 // ----------------------------------------------------------------------------
 #[cfg(test)]
 mod e2e_tests {
-    use crate::addr::{self, Ax25Address, FullSockaddrAx25, SockaddrAx25, AF_AX25, SOCK_SEQPACKET};
-    use libc::{c_int, sockaddr, socklen_t};
+    use crate::addr::{
+        self, Ax25Address, FullSockaddrAx25, SockaddrAx25, AF_AX25, SOCK_DGRAM, SOCK_SEQPACKET,
+        SOL_AX25,
+    };
+    use libc::{c_int, c_void, sockaddr, socklen_t};
     use rhp::framing::{read_frame, write_frame};
     use rhp::messages::Frame;
     use std::net::{TcpListener, TcpStream};
@@ -542,9 +858,12 @@ mod e2e_tests {
 
     /// A request-driven mock RHP server. Correlates replies by `id`; injects
     /// status/accept pushes after `PUSH_DELAY`. Returns its `host:port`.
-    fn spawn_mock() -> String {
+    fn spawn_mock() -> (String, Arc<Mutex<Vec<Frame>>>) {
+        // Captures every `sendto` the interposer emits, for assertion.
+        let sendtos: Arc<Mutex<Vec<Frame>>> = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let sendtos_srv = sendtos.clone();
         std::thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
             let mut reader = sock.try_clone().unwrap();
@@ -586,6 +905,23 @@ mod e2e_tests {
                     "socket" => {
                         let h = next.fetch_add(1, Ordering::Relaxed);
                         reply(&writer, id, Some(h));
+                        // A dgram socket: deliver an inbound UI frame after a
+                        // delay so the recvfrom test proves it waits for RX.
+                        if f.value.get("mode").and_then(|m| m.as_str()) == Some("dgram") {
+                            let w = writer.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(PUSH_DELAY);
+                                let push = format!(
+                                    r#"{{"type":"recv","handle":{h},"remote":"G0ABC-1","local":"GB7RDG-2","pid":240,"data":"beacon-rx"}}"#
+                                );
+                                let _ = write_frame(&mut *w.lock().unwrap(), push.as_bytes());
+                            });
+                        }
+                    }
+                    "sendto" => {
+                        // Record the emitted UI frame, then ack it.
+                        sendtos_srv.lock().unwrap().push(f.clone());
+                        reply(&writer, id, None);
                     }
                     "listen" => {
                         let lh = f.handle().unwrap();
@@ -606,7 +942,7 @@ mod e2e_tests {
                 }
             }
         });
-        addr
+        (addr, sendtos)
     }
 
     fn poll_writable(fd: c_int, timeout_ms: c_int) -> bool {
@@ -617,7 +953,8 @@ mod e2e_tests {
 
     #[test]
     fn interposer_connect_and_accept_end_to_end() {
-        std::env::set_var("PDN_RHP_ADDR", spawn_mock());
+        let (mock_addr, sendtos) = spawn_mock();
+        std::env::set_var("PDN_RHP_ADDR", mock_addr);
 
         // ---- (a) blocking connect unblocks only after status(Connected) ----
         let fd = unsafe { crate::socket(AF_AX25, SOCK_SEQPACKET, 0) };
@@ -720,6 +1057,93 @@ mod e2e_tests {
 
         unsafe { crate::close(child) };
         unsafe { crate::close(lfd) };
+
+        // ---- (d) dgram: socket -> bind, then a blocking recvfrom gets the UI --
+        let dfd = unsafe { crate::socket(AF_AX25, SOCK_DGRAM, 0) };
+        assert!(dfd >= 0, "dgram socket() failed");
+        let dlocal = sax25("GB7RDG-2");
+        assert_eq!(
+            unsafe {
+                crate::bind(
+                    dfd,
+                    &dlocal as *const SockaddrAx25 as *const sockaddr,
+                    std::mem::size_of::<SockaddrAx25>() as socklen_t,
+                )
+            },
+            0,
+            "dgram bind failed (errno {})",
+            errno()
+        );
+
+        // sendto with the default PID 0xF0 (no AX25_PIDINCL set yet).
+        let beacon = b"de GB7RDG-2 beacon";
+        let dest = sax25("BEACON");
+        let n = unsafe {
+            crate::sendto(
+                dfd,
+                beacon.as_ptr() as *const c_void,
+                beacon.len(),
+                0,
+                &dest as *const SockaddrAx25 as *const sockaddr,
+                std::mem::size_of::<SockaddrAx25>() as socklen_t,
+            )
+        };
+        assert_eq!(n, beacon.len() as isize, "sendto returned {n} (errno {})", errno());
+
+        // recvfrom blocks until the injected UI frame arrives, fills the source.
+        let mut src: SockaddrAx25 = unsafe { std::mem::zeroed() };
+        let mut slen = std::mem::size_of::<SockaddrAx25>() as socklen_t;
+        let mut rbuf = [0u8; 128];
+        let rn = unsafe {
+            crate::recvfrom(
+                dfd,
+                rbuf.as_mut_ptr() as *mut c_void,
+                rbuf.len(),
+                0,
+                &mut src as *mut SockaddrAx25 as *mut sockaddr,
+                &mut slen,
+            )
+        };
+        assert!(rn > 0, "dgram recvfrom failed (errno {})", errno());
+        assert_eq!(&rbuf[..rn as usize], b"beacon-rx", "wrong UI payload");
+        assert_eq!(addr::decode(&src.sax25_call.ax25_call), "G0ABC-1", "wrong source");
+
+        // ---- (e) AX25_PIDINCL: the app's first byte becomes the sent PID -----
+        let on: c_int = 1;
+        unsafe {
+            crate::setsockopt(
+                dfd,
+                SOL_AX25,
+                crate::AX25_PIDINCL,
+                &on as *const c_int as *const c_void,
+                std::mem::size_of::<c_int>() as socklen_t,
+            )
+        };
+        let ip_frame = [0xCCu8, b'i', b'p']; // PID 0xCC (IP), data "ip"
+        let n2 = unsafe {
+            crate::sendto(
+                dfd,
+                ip_frame.as_ptr() as *const c_void,
+                ip_frame.len(),
+                0,
+                &dest as *const SockaddrAx25 as *const sockaddr,
+                std::mem::size_of::<SockaddrAx25>() as socklen_t,
+            )
+        };
+        assert_eq!(n2, ip_frame.len() as isize, "PIDINCL sendto returned {n2}");
+
+        // Assert the two captured sendto frames carried the right fields.
+        let captured = sendtos.lock().unwrap();
+        assert_eq!(captured.len(), 2, "expected two sendto frames");
+        assert_eq!(captured[0].remote(), Some("BEACON"));
+        assert_eq!(captured[0].local(), Some("GB7RDG-2"));
+        assert_eq!(captured[0].pid(), Some(0xF0), "default PID must be 0xF0");
+        assert_eq!(captured[0].data_str(), Some("de GB7RDG-2 beacon"));
+        assert_eq!(captured[1].pid(), Some(0xCC), "PIDINCL must strip byte 0 as PID");
+        assert_eq!(captured[1].data_str(), Some("ip"), "PIDINCL must send the rest as data");
+        drop(captured);
+
+        unsafe { crate::close(dfd) };
     }
 
     #[test]

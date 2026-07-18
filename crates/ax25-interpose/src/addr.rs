@@ -9,9 +9,11 @@
 
 use libc::{c_char, c_int};
 
-/// AF_AX25 (Linux family 3) and SOCK_SEQPACKET (5) — the pair we intercept.
+/// AF_AX25 (Linux family 3). SOCK_SEQPACKET (5) is a connected AX.25 session;
+/// SOCK_DGRAM (2) is a connectionless UI frame. We intercept both.
 pub const AF_AX25: i32 = 3;
 pub const SOCK_SEQPACKET: i32 = 5;
+pub const SOCK_DGRAM: i32 = 2;
 /// setsockopt level for AX.25 options.
 pub const SOL_AX25: i32 = 257;
 

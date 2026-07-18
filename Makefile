@@ -7,7 +7,11 @@ PREFIX ?= /usr/local
 LIBDIR ?= $(PREFIX)/lib
 REL    := target/release
 
-.PHONY: all build symlinks test install clean
+CC      ?= cc
+CFLAGS  ?= -O2 -Wall
+SAMPLES := ax25_connect ax25_answer ax25_beacon ax25_ui_monitor
+
+.PHONY: all build symlinks test install clean samples
 
 all: build symlinks
 
@@ -32,5 +36,13 @@ install: all
 	install -m 0755 $(REL)/libax25_interpose.so $(DESTDIR)$(LIBDIR)/ax25-interpose.so
 	@echo "installed to $(DESTDIR)$(LIBDIR)"
 
+# Build the sample C apps (samples/README.md). Independent of the Rust build:
+# they use only the standard AF_AX25 socket API and link no library, so they are
+# NOT part of `cargo build`. Binaries land in samples/.
+samples:
+	$(foreach s,$(SAMPLES),$(CC) $(CFLAGS) -o samples/$(s) samples/$(s).c &&) true
+	@echo "samples built in samples/"
+
 clean:
 	cargo clean
+	rm -f $(addprefix samples/,$(SAMPLES))
