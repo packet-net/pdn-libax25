@@ -33,9 +33,9 @@ pub struct SockaddrAx25 {
     pub sax25_ndigis: c_int,
 }
 
-// Full sockaddr including digipeaters — retained for the digipeater path
-// (TODO(N1)); currently only the leading fields are parsed via SockaddrAx25.
-#[allow(dead_code)]
+// Full sockaddr including digipeaters. `getsockname` on an accepted socket uses
+// this layout because ax25d reads the local port callsign from fsa_digipeater[0]
+// (not fsa_ax25.sax25_call); see `write_sockname`.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct FullSockaddrAx25 {
@@ -122,6 +122,29 @@ pub unsafe fn write_call(
     *len = full_len as libc::socklen_t;
 }
 
+/// Write the local bound callsign into a caller-provided buffer as a
+/// `full_sockaddr_ax25`, in the layout `ax25d` reads on `getsockname()`:
+/// the local port callsign in `fsa_digipeater[0]`. We also mirror it into
+/// `fsa_ax25.sax25_call` (harmless; some callers read there) and set
+/// `sax25_ndigis = 1` so the digipeater slot is considered present.
+pub unsafe fn write_sockname(addr: *mut libc::sockaddr, len: *mut libc::socklen_t, call: &str) {
+    if addr.is_null() || len.is_null() {
+        return;
+    }
+    let mut fsa: FullSockaddrAx25 = std::mem::zeroed();
+    fsa.fsa_ax25.sax25_family = AF_AX25 as u16;
+    fsa.fsa_ax25.sax25_call = Ax25Address { ax25_call: encode(call) };
+    fsa.fsa_ax25.sax25_ndigis = 1;
+    fsa.fsa_digipeater[0] = Ax25Address { ax25_call: encode(call) };
+
+    let full_len = std::mem::size_of::<FullSockaddrAx25>();
+    let avail = *len as usize;
+    let src = &fsa as *const FullSockaddrAx25 as *const u8;
+    let n = avail.min(full_len);
+    std::ptr::copy_nonoverlapping(src, addr as *mut u8, n);
+    *len = full_len as libc::socklen_t;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +155,24 @@ mod tests {
             let enc = encode(call);
             assert_eq!(decode(&enc), call);
         }
+    }
+
+    #[test]
+    fn write_sockname_puts_local_call_in_digipeater0() {
+        // ax25d reads the local port callsign from fsa_digipeater[0].
+        let mut buf = [0u8; std::mem::size_of::<FullSockaddrAx25>()];
+        let mut len = buf.len() as libc::socklen_t;
+        unsafe {
+            write_sockname(
+                buf.as_mut_ptr() as *mut libc::sockaddr,
+                &mut len,
+                "GB7RDG-1",
+            );
+            let fsa = &*(buf.as_ptr() as *const FullSockaddrAx25);
+            assert_eq!(fsa.fsa_ax25.sax25_family, AF_AX25 as u16);
+            assert_eq!(decode(&fsa.fsa_digipeater[0].ax25_call), "GB7RDG-1");
+            assert_eq!(decode(&fsa.fsa_ax25.sax25_call.ax25_call), "GB7RDG-1");
+        }
+        assert_eq!(len as usize, std::mem::size_of::<FullSockaddrAx25>());
     }
 }

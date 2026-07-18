@@ -14,8 +14,16 @@
 // the `rhp` client writes inbound data into our end of the pair, and our
 // write/send wrappers forward outbound data to RHP `send`.
 //
-// STATUS: the outbound connect + data + close path is implemented; the inbound
-// listener/accept path is skeleton-level with clearly marked TODO(N1) items.
+// STATUS: both directions are implemented.
+//   * Outbound: connect() waits for the async status(Connected) push (blocking),
+//     or returns EINPROGRESS + becomes writable on completion with a drainable
+//     SO_ERROR (O_NONBLOCK), rather than treating the openReply as "connected".
+//   * Inbound: socket/bind/listen/accept are wired; accept() blocks on the RHP
+//     client's accept condvar (or EAGAIN under O_NONBLOCK), returns a child fd
+//     with the caller's callsign, and getsockname() reports the local port call
+//     in the layout ax25d reads.
+//   * recv never silently drops: a per-handle buffer + flusher thread applies
+//     back-pressure without stalling the shared reader thread.
 //
 // Build output is `libax25_interpose.so`; use it via LD_PRELOAD (or symlink to
 // `ax25-interpose.so`).
@@ -26,10 +34,24 @@ mod state;
 
 use addr::{AF_AX25, SOCK_SEQPACKET, SOL_AX25};
 use libc::{c_int, c_void, size_t, sockaddr, socklen_t, ssize_t};
+use std::time::Duration;
 
 // AX.25 setsockopt option names we care about (from <netax25/ax25.h>).
 const AX25_WINDOW: c_int = 1;
 const AX25_PACLEN: c_int = 10;
+
+/// How long a blocking connect() waits for the AX.25 SABM/UA handshake before
+/// giving up with ETIMEDOUT. Generous, because SABM is retried (T1 * N2) and a
+/// real link can take tens of seconds to come up; the wait also aborts early if
+/// the engine reports failure or the transport drops.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// True if `fd` is currently in non-blocking mode. fcntl is not interposed, so
+/// this reads the real socketpair fd's flags directly.
+unsafe fn is_nonblocking(fd: c_int) -> bool {
+    let flags = libc::fcntl(fd, libc::F_GETFL);
+    flags >= 0 && (flags & libc::O_NONBLOCK) != 0
+}
 
 #[inline]
 unsafe fn set_errno(e: c_int) {
@@ -134,27 +156,50 @@ pub unsafe extern "C" fn connect(fd: c_int, addr: *const sockaddr, len: socklen_
         return -1;
     };
 
-    // NOTE: AX.25 connect is asynchronous on the wire — the RHP openReply
-    // arrives before the SABM/UA handshake completes. We treat a successful
-    // openReply as "connected" for this skeleton. TODO(N1): wait for a
-    // status(Connected) push before returning, and honour O_NONBLOCK.
-    match client.open_connect(&local, &remote) {
-        Ok(res) => {
-            let inner = {
-                let mut g = state::fds().lock().unwrap();
-                let Some(s) = g.get_mut(&fd) else {
-                    set_errno(libc::EBADF);
-                    return -1;
-                };
-                s.handle = Some(res.handle);
-                s.remote = Some(remote);
-                s.inner_fd
-            };
-            state::handle_inner().lock().unwrap().insert(res.handle, inner);
-            0
-        }
+    // AX.25 connect is asynchronous on the wire: the RHP openReply only means
+    // the `open` was accepted; the link is not up until a status(Connected) push
+    // (or it fails via a close push / error). So `open_connect` starts it, then
+    // we wait for that transition — respecting O_NONBLOCK.
+    let res = match client.open_connect(&local, &remote) {
+        Ok(res) => res,
         Err(e) => {
             set_errno(e.to_errno());
+            return -1;
+        }
+    };
+
+    let (app_fd, inner) = {
+        let mut g = state::fds().lock().unwrap();
+        let Some(s) = g.get_mut(&fd) else {
+            set_errno(libc::EBADF);
+            return -1;
+        };
+        s.handle = Some(res.handle);
+        s.remote = Some(remote);
+        (s.app_fd, s.inner_fd)
+    };
+    state::recv_pump().register(res.handle, inner);
+
+    if is_nonblocking(fd) {
+        // Standard non-blocking-connect idiom: return EINPROGRESS now; make the
+        // fd become writable once the link resolves (the reader thread drains
+        // the gate on status/close); the app then reads SO_ERROR via getsockopt.
+        state::arm_connect_gate(res.handle, app_fd, inner);
+        // Close the race where the link resolved between `open_connect` and
+        // arming the gate (the reader's drain would have found no gate): if the
+        // result is already in, drain now. resolve_connect_gate is idempotent.
+        if client.connect_result(res.handle).is_some() {
+            state::resolve_connect_gate(res.handle);
+        }
+        set_errno(libc::EINPROGRESS);
+        return -1;
+    }
+
+    // Blocking connect: park until the link comes up or fails.
+    match client.wait_connected(res.handle, Some(CONNECT_TIMEOUT)) {
+        Ok(()) => 0,
+        Err(errno) => {
+            set_errno(errno);
             -1
         }
     }
@@ -166,8 +211,10 @@ pub unsafe extern "C" fn connect(fd: c_int, addr: *const sockaddr, len: socklen_
 
 /// `int accept(int fd, struct sockaddr *addr, socklen_t *len)`.
 ///
-/// Skeleton: blocks (busy-waits) until an `accept` push queues a child. The
-/// child gets its own socketpair-backed fd wired to the child RHP handle.
+/// Blocks (on the RHP client's accept condvar — no busy-wait) until an `accept`
+/// push queues a child, honouring O_NONBLOCK (EAGAIN when nothing waits). The
+/// child gets its own socketpair-backed fd wired to the child RHP handle, and
+/// the returned `addr` is filled with the caller's callsign.
 #[no_mangle]
 pub unsafe extern "C" fn accept(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
     if !state::is_ax25_fd(fd) {
@@ -187,23 +234,28 @@ pub unsafe extern "C" fn accept(fd: c_int, addr: *mut sockaddr, len: *mut sockle
         set_errno(libc::EINVAL);
         return -1;
     };
+    let Some(client) = state::ensure_client() else {
+        set_errno(libc::ECONNABORTED);
+        return -1;
+    };
 
-    // TODO(N1): replace this busy-wait with a condvar or eventfd so accept()
-    // blocks efficiently and honours O_NONBLOCK / a timeout.
-    let info = loop {
-        if let Some(info) = state::accepts()
-            .lock()
-            .unwrap()
-            .get_mut(&listener_handle)
-            .and_then(|q| q.pop_front())
-        {
-            break info;
+    let info = if is_nonblocking(fd) {
+        match client.try_accept(listener_handle) {
+            Some(info) => info,
+            None => {
+                set_errno(libc::EAGAIN);
+                return -1;
+            }
         }
-        if state::ensure_client().map(|c| c.is_closed()).unwrap_or(true) {
-            set_errno(libc::ECONNABORTED);
-            return -1;
+    } else {
+        // Block until a child arrives (None => the transport dropped).
+        match client.wait_accept(listener_handle, None) {
+            Some(info) => info,
+            None => {
+                set_errno(libc::ECONNABORTED);
+                return -1;
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
     };
 
     let Some(child_fd) = state::create_ax25_fd() else {
@@ -218,11 +270,9 @@ pub unsafe extern "C" fn accept(fd: c_int, addr: *mut sockaddr, len: *mut sockle
         s.local = info.local.clone().or(local);
         s.inner_fd
     };
-    state::handle_inner()
-        .lock()
-        .unwrap()
-        .insert(info.child_handle, inner);
+    state::recv_pump().register(info.child_handle, inner);
 
+    // Fill the returned peer sockaddr with the caller's callsign.
     if let Some(remote) = &info.remote {
         addr::write_call(addr, len, remote);
     }
@@ -230,6 +280,10 @@ pub unsafe extern "C" fn accept(fd: c_int, addr: *mut sockaddr, len: *mut sockle
 }
 
 /// `int getsockname(int fd, struct sockaddr *addr, socklen_t *len)`.
+///
+/// Returns a `full_sockaddr_ax25` with the local bound callsign in
+/// `fsa_digipeater[0]` — the layout `ax25d` reads to identify the local port a
+/// connection came in on.
 #[no_mangle]
 pub unsafe extern "C" fn getsockname(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
     if state::is_ax25_fd(fd) {
@@ -239,7 +293,7 @@ pub unsafe extern "C" fn getsockname(fd: c_int, addr: *mut sockaddr, len: *mut s
             .get(&fd)
             .and_then(|s| s.local.clone())
             .unwrap_or_default();
-        addr::write_call(addr, len, &local);
+        addr::write_sockname(addr, len, &local);
         return 0;
     }
     real::getsockname()(fd, addr, len)
@@ -295,6 +349,49 @@ pub unsafe extern "C" fn setsockopt(
         return 0;
     }
     real::setsockopt()(fd, level, optname, optval, optlen)
+}
+
+/// `int getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen)`.
+///
+/// The one option we must implement for AX.25 fds is `SOL_SOCKET`/`SO_ERROR`:
+/// the non-blocking-connect idiom reads it (once the fd is writable) to collect
+/// the pending connect result (0 on success, an errno on failure). Other
+/// SOL_SOCKET options are served by the real socketpair; SOL_AX25 gets report 0.
+#[no_mangle]
+pub unsafe extern "C" fn getsockopt(
+    fd: c_int,
+    level: c_int,
+    optname: c_int,
+    optval: *mut c_void,
+    optlen: *mut socklen_t,
+) -> c_int {
+    if state::is_ax25_fd(fd) {
+        if level == libc::SOL_SOCKET && optname == libc::SO_ERROR {
+            if optval.is_null() || optlen.is_null() || (*optlen as usize) < std::mem::size_of::<c_int>() {
+                set_errno(libc::EINVAL);
+                return -1;
+            }
+            let handle = state::fds().lock().unwrap().get(&fd).and_then(|s| s.handle);
+            let err: c_int = match handle {
+                Some(h) => state::ensure_client().map(|c| c.take_connect_error(h)).unwrap_or(0),
+                None => 0,
+            };
+            *(optval as *mut c_int) = err;
+            *optlen = std::mem::size_of::<c_int>() as socklen_t;
+            return 0;
+        }
+        if level == SOL_AX25 {
+            // Report success with a zeroed value; app AX.25 gets are advisory.
+            if !optval.is_null() && !optlen.is_null() && (*optlen as usize) >= std::mem::size_of::<c_int>() {
+                *(optval as *mut c_int) = 0;
+                *optlen = std::mem::size_of::<c_int>() as socklen_t;
+            }
+            return 0;
+        }
+        // Other SOL_SOCKET options: the underlying socketpair answers correctly.
+        return real::getsockopt()(fd, level, optname, optval, optlen);
+    }
+    real::getsockopt()(fd, level, optname, optval, optlen)
 }
 
 // ----------------------------------------------------------------------------
@@ -400,4 +497,240 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
         return 0;
     }
     real::close()(fd)
+}
+
+// ----------------------------------------------------------------------------
+// End-to-end tests.
+//
+// These exercise the real C entry points (socket/connect/accept/getsockopt/…)
+// in-process against a mock RHP server. Because the interposer's #[no_mangle]
+// symbols are present in the test binary they interpose the whole process, but
+// every non-AX.25 fd delegates to real libc via dlsym(RTLD_NEXT), so std / the
+// mock server keep working — exactly as under LD_PRELOAD.
+//
+// The interposer keeps ONE process-global RHP client (cached on first use), so
+// all scenarios share a single mock over one connection and MUST live in a
+// single #[test] to avoid cross-test interference on that global state.
+// ----------------------------------------------------------------------------
+#[cfg(test)]
+mod e2e_tests {
+    use crate::addr::{self, Ax25Address, FullSockaddrAx25, SockaddrAx25, AF_AX25, SOCK_SEQPACKET};
+    use libc::{c_int, sockaddr, socklen_t};
+    use rhp::framing::{read_frame, write_frame};
+    use rhp::messages::Frame;
+    use std::net::{TcpListener, TcpStream};
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// Delay the mock waits before pushing an async status(Connected) / accept,
+    /// so tests can prove we actually wait for the async event.
+    const PUSH_DELAY: Duration = Duration::from_millis(150);
+
+    fn errno() -> c_int {
+        unsafe { *libc::__errno_location() }
+    }
+
+    fn sax25(call: &str) -> SockaddrAx25 {
+        SockaddrAx25 {
+            sax25_family: AF_AX25 as u16,
+            sax25_call: Ax25Address { ax25_call: addr::encode(call) },
+            sax25_ndigis: 0,
+        }
+    }
+
+    /// A request-driven mock RHP server. Correlates replies by `id`; injects
+    /// status/accept pushes after `PUSH_DELAY`. Returns its `host:port`.
+    fn spawn_mock() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut reader = sock.try_clone().unwrap();
+            let writer = Arc::new(Mutex::new(sock));
+            let next = Arc::new(AtomicU64::new(100));
+
+            let reply = |w: &Arc<Mutex<TcpStream>>, id: u64, handle: Option<u64>| {
+                let body = match handle {
+                    Some(h) => format!(
+                        r#"{{"type":"reply","id":{id},"handle":{h},"errCode":0,"errText":"Ok"}}"#
+                    ),
+                    None => format!(r#"{{"type":"reply","id":{id},"errCode":0,"errText":"Ok"}}"#),
+                };
+                write_frame(&mut *w.lock().unwrap(), body.as_bytes()).unwrap();
+            };
+
+            loop {
+                let bytes = match read_frame(&mut reader) {
+                    Ok(Some(b)) => b,
+                    _ => break,
+                };
+                let f = match Frame::parse(&bytes) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                let id = f.id().unwrap_or(0);
+                match f.typ() {
+                    "open" => {
+                        let h = next.fetch_add(1, Ordering::Relaxed);
+                        reply(&writer, id, Some(h));
+                        // Link comes up asynchronously after a delay.
+                        let w = writer.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(PUSH_DELAY);
+                            let push = format!(r#"{{"type":"status","handle":{h},"flags":2}}"#);
+                            let _ = write_frame(&mut *w.lock().unwrap(), push.as_bytes());
+                        });
+                    }
+                    "socket" => {
+                        let h = next.fetch_add(1, Ordering::Relaxed);
+                        reply(&writer, id, Some(h));
+                    }
+                    "listen" => {
+                        let lh = f.handle().unwrap();
+                        reply(&writer, id, None);
+                        // An inbound connection arrives after a delay.
+                        let child = next.fetch_add(1, Ordering::Relaxed);
+                        let w = writer.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(PUSH_DELAY);
+                            let push = format!(
+                                r#"{{"type":"accept","handle":{lh},"child":{child},"remote":"M0ABC-2","local":"GB7RDG-1"}}"#
+                            );
+                            let _ = write_frame(&mut *w.lock().unwrap(), push.as_bytes());
+                        });
+                    }
+                    // bind / send / close / anything else: bare ack.
+                    _ => reply(&writer, id, None),
+                }
+            }
+        });
+        addr
+    }
+
+    fn poll_writable(fd: c_int, timeout_ms: c_int) -> bool {
+        let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        n > 0 && (pfd.revents & libc::POLLOUT) != 0
+    }
+
+    #[test]
+    fn interposer_connect_and_accept_end_to_end() {
+        std::env::set_var("PDN_RHP_ADDR", spawn_mock());
+
+        // ---- (a) blocking connect unblocks only after status(Connected) ----
+        let fd = unsafe { crate::socket(AF_AX25, SOCK_SEQPACKET, 0) };
+        assert!(fd >= 0, "socket() failed");
+        let remote = sax25("GB7RDG");
+        let start = Instant::now();
+        let rc = unsafe {
+            crate::connect(
+                fd,
+                &remote as *const SockaddrAx25 as *const sockaddr,
+                std::mem::size_of::<SockaddrAx25>() as socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "blocking connect should succeed (errno {})", errno());
+        assert!(
+            start.elapsed() >= PUSH_DELAY - Duration::from_millis(40),
+            "blocking connect returned before status(Connected)"
+        );
+        unsafe { crate::close(fd) };
+
+        // ---- (b) non-blocking connect: EINPROGRESS, writable + SO_ERROR==0 ----
+        let nfd = unsafe { crate::socket(AF_AX25, SOCK_SEQPACKET, 0) };
+        assert!(nfd >= 0);
+        let fl = unsafe { libc::fcntl(nfd, libc::F_GETFL) };
+        unsafe { libc::fcntl(nfd, libc::F_SETFL, fl | libc::O_NONBLOCK) };
+        let rc = unsafe {
+            crate::connect(
+                nfd,
+                &remote as *const SockaddrAx25 as *const sockaddr,
+                std::mem::size_of::<SockaddrAx25>() as socklen_t,
+            )
+        };
+        assert_eq!(rc, -1, "non-blocking connect must return -1");
+        assert_eq!(errno(), libc::EINPROGRESS, "expected EINPROGRESS");
+        // Not writable yet: the link is still coming up.
+        assert!(!poll_writable(nfd, 0), "fd writable before Connected");
+        // SO_ERROR is still pending (0) while connecting.
+        let mut so_err: c_int = -1;
+        let mut olen = std::mem::size_of::<c_int>() as socklen_t;
+        unsafe {
+            crate::getsockopt(
+                nfd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut so_err as *mut c_int as *mut libc::c_void,
+                &mut olen,
+            )
+        };
+        assert_eq!(so_err, 0, "pending connect should report SO_ERROR 0");
+        // Becomes writable once Connected, then SO_ERROR drains to 0.
+        assert!(poll_writable(nfd, 2000), "fd never became writable after Connected");
+        let mut so_err: c_int = -1;
+        unsafe {
+            crate::getsockopt(
+                nfd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut so_err as *mut c_int as *mut libc::c_void,
+                &mut olen,
+            )
+        };
+        assert_eq!(so_err, 0, "SO_ERROR should be 0 after a successful connect");
+        unsafe { crate::close(nfd) };
+
+        // ---- (c) accept() returns a child fd with the caller's callsign ----
+        let lfd = unsafe { crate::socket(AF_AX25, SOCK_SEQPACKET, 0) };
+        assert!(lfd >= 0);
+        let local = sax25("GB7RDG-1");
+        assert_eq!(
+            unsafe {
+                crate::bind(
+                    lfd,
+                    &local as *const SockaddrAx25 as *const sockaddr,
+                    std::mem::size_of::<SockaddrAx25>() as socklen_t,
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { crate::listen(lfd, 5) }, 0, "listen failed (errno {})", errno());
+
+        let mut peer: FullSockaddrAx25 = unsafe { std::mem::zeroed() };
+        let mut plen = std::mem::size_of::<FullSockaddrAx25>() as socklen_t;
+        let child = unsafe {
+            crate::accept(lfd, &mut peer as *mut FullSockaddrAx25 as *mut sockaddr, &mut plen)
+        };
+        assert!(child >= 0, "accept failed (errno {})", errno());
+        // accept fills the peer sockaddr with the caller's callsign.
+        assert_eq!(addr::decode(&peer.fsa_ax25.sax25_call.ax25_call), "M0ABC-2");
+
+        // getsockname on the child returns the local port callsign in digi[0].
+        let mut me: FullSockaddrAx25 = unsafe { std::mem::zeroed() };
+        let mut mlen = std::mem::size_of::<FullSockaddrAx25>() as socklen_t;
+        assert_eq!(
+            unsafe {
+                crate::getsockname(child, &mut me as *mut FullSockaddrAx25 as *mut sockaddr, &mut mlen)
+            },
+            0
+        );
+        assert_eq!(addr::decode(&me.fsa_digipeater[0].ax25_call), "GB7RDG-1");
+
+        unsafe { crate::close(child) };
+        unsafe { crate::close(lfd) };
+    }
+
+    #[test]
+    fn non_ax25_socket_passes_through() {
+        // A plain TCP socket must be untouched by the interposer (delegated to
+        // real libc), proving passthrough survives whole-process interposition.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let s = TcpStream::connect(addr).unwrap();
+        assert!(!crate::state::is_ax25_fd(s.as_raw_fd()));
+        drop(s);
+        drop(l);
+    }
 }

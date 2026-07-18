@@ -89,11 +89,27 @@ description`); set `AX25_AXPORTS` to point at an alternative file for testing.
 
 ## Status
 
-The **outbound** path is implemented and verified end-to-end against a mock RHP
-server (`socket → bind → connect → write → read → close` maps to RHP
-`open → send → recv → close`). The **inbound listener/accept** path is
-skeleton-level with `TODO(N1)` markers. See the source and the project's
-issue/TODO list for what remains.
+Both directions are implemented and verified end-to-end against an in-process
+mock RHP server:
+
+* **Outbound** `socket → bind → connect → write → read → close` maps to RHP
+  `open → send → recv → close`. `connect()` now honours that AX.25 connect is
+  asynchronous: a **blocking** fd blocks until the `status(Connected)` push (not
+  the openReply), while an **O_NONBLOCK** fd returns `EINPROGRESS`, becomes
+  writable once the link is up, and exposes the result via
+  `getsockopt(SO_ERROR)` — so the standard non-blocking-connect + `select`/`poll`
+  idiom works.
+* **Inbound** `socket → bind → listen → accept` is wired for `ax25d`: `accept()`
+  blocks on a condvar (no busy-wait; `EAGAIN` under O_NONBLOCK), returns a child
+  fd carrying the caller's callsign, and `getsockname()` reports the local port
+  callsign in `fsa_digipeater[0]`.
+* **Receive back-pressure**: inbound bytes are never silently dropped — a
+  per-handle buffer plus a flusher thread drains into the socketpair as the app
+  reads, without stalling the shared RHP reader thread.
+
+Remaining `TODO(N1)` markers cover non-blocking niceties out of scope here (AX.25
+timer socket options captured as no-ops; connect-via-digipeater paths; the
+`libax25` `get_call` uid→callsign mapping).
 
 ## Licence
 

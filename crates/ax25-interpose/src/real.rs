@@ -40,6 +40,8 @@ pub type AcceptFn = unsafe extern "C" fn(c_int, *mut sockaddr, *mut socklen_t) -
 pub type NameFn = unsafe extern "C" fn(c_int, *mut sockaddr, *mut socklen_t) -> c_int;
 pub type SetsockoptFn =
     unsafe extern "C" fn(c_int, c_int, c_int, *const c_void, socklen_t) -> c_int;
+pub type GetsockoptFn =
+    unsafe extern "C" fn(c_int, c_int, c_int, *mut c_void, *mut socklen_t) -> c_int;
 pub type ReadFn = unsafe extern "C" fn(c_int, *mut c_void, size_t) -> ssize_t;
 pub type WriteFn = unsafe extern "C" fn(c_int, *const c_void, size_t) -> ssize_t;
 pub type RecvFn = unsafe extern "C" fn(c_int, *mut c_void, size_t, c_int) -> ssize_t;
@@ -62,6 +64,7 @@ real_fn!(accept, "accept", AcceptFn);
 real_fn!(getsockname, "getsockname", NameFn);
 real_fn!(getpeername, "getpeername", NameFn);
 real_fn!(setsockopt, "setsockopt", SetsockoptFn);
+real_fn!(getsockopt, "getsockopt", GetsockoptFn);
 real_fn!(read, "read", ReadFn);
 real_fn!(write, "write", WriteFn);
 real_fn!(recv, "recv", RecvFn);
