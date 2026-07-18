@@ -4,15 +4,21 @@ Let **unmodified** Linux ham-radio applications (`ax25-apps`, `ax25-tools`, FBB,
 …) use the **pdn** AX.25 stack (packet.net) instead of the Linux kernel
 `AF_AX25` stack, which was removed from mainline in Linux 7.1.
 
+This is the **native AF_AX25 seam** (your app addresses a callsign). Its
+counterpart for ordinary **IP** software (any unmodified IP app, addressed by IP,
+carried over radio) is [`pdn-net`](https://github.com/packet-net/pdn-net);
+packet.net's [network-integration ADR](https://github.com/packet-net/packet.net/blob/main/docs/network-integration-adr.md)
+covers when to use which.
+
 It ships **two** native `.so` artifacts (both Rust `cdylib`s), licence
 **LGPL-3.0-or-later**:
 
 | Artifact | Role |
 |----------|------|
-| **`libax25.so.1`** | Drop-in replacement for ve7fet **libax25**'s *helper* library — address parsing (`ax25_aton*`/`ax25_ntoa`/`ax25_cmp`/`ax25_validate`) and `axports` config parsing. libax25 has **no** connection code; apps link `-lax25` only for these helpers. SONAME is `libax25.so.1` (upstream real file `libax25.so.1.0.1`, pkg 1.2.2). |
-| **`ax25-interpose.so`** | An `LD_PRELOAD` libc interposer. It wraps the socket/IO calls, detects `AF_AX25` (family 3) sockets — `SOCK_SEQPACKET` (connected sessions) and `SOCK_DGRAM` (connectionless UI) — routes them to a pdn **RHPv2** connection, and passes every other call straight through to real libc via `dlsym(RTLD_NEXT, …)`. Build output is `libax25_interpose.so`. |
+| **`libax25.so.1`** | Drop-in replacement for ve7fet **libax25**'s *helper* library - address parsing (`ax25_aton*`/`ax25_ntoa`/`ax25_cmp`/`ax25_validate`) and `axports` config parsing. libax25 has **no** connection code; apps link `-lax25` only for these helpers. SONAME is `libax25.so.1` (upstream real file `libax25.so.1.0.1`, pkg 1.2.2). |
+| **`ax25-interpose.so`** | An `LD_PRELOAD` libc interposer. It wraps the socket/IO calls, detects `AF_AX25` (family 3) sockets - `SOCK_SEQPACKET` (connected sessions) and `SOCK_DGRAM` (connectionless UI) - routes them to a pdn **RHPv2** connection, and passes every other call straight through to real libc via `dlsym(RTLD_NEXT, …)`. Build output is `libax25_interpose.so`. |
 
-Both share an internal **`rhp`** crate — an RHPv2 client over loopback TCP
+Both share an internal **`rhp`** crate - an RHPv2 client over loopback TCP
 `127.0.0.1:9000` (override with `PDN_RHP_ADDR`).
 
 ## Why two pieces
@@ -20,7 +26,7 @@ Both share an internal **`rhp`** crate — an RHPv2 client over loopback TCP
 Upstream libax25 is *only* helpers; the actual connection work is done by apps
 talking to the kernel `AF_AX25` socket API. With the kernel stack gone:
 
-1. `libax25.so.1` provides the helper ABI apps link against — crucially with
+1. `libax25.so.1` provides the helper ABI apps link against - crucially with
    **`axports` parsing that does NOT require a kernel `ARPHRD_AX25` netdevice**
    (upstream refuses to list a port without one; we omit that check, so every
    well-formed `axports` line is an active port). This is the critical fix.
@@ -42,7 +48,7 @@ talking to the kernel `AF_AX25` socket API. With the kernel stack gone:
 
 Implemented clean-room from the RHPv2 wire spec (`rhp2lib-net/docs/protocol.md`,
 PWP-0222 / PWP-0245) and the MIT reference client `RhpV2.Client` (used as a model
-only — pdn's GPL/AGPL `Packet.Rhp2` is **not** linked).
+only - pdn's GPL/AGPL `Packet.Rhp2` is **not** linked).
 
 ## Build
 
@@ -97,13 +103,13 @@ mock RHP server:
   asynchronous: a **blocking** fd blocks until the `status(Connected)` push (not
   the openReply), while an **O_NONBLOCK** fd returns `EINPROGRESS`, becomes
   writable once the link is up, and exposes the result via
-  `getsockopt(SO_ERROR)` — so the standard non-blocking-connect + `select`/`poll`
+  `getsockopt(SO_ERROR)` - so the standard non-blocking-connect + `select`/`poll`
   idiom works.
 * **Inbound** `socket → bind → listen → accept` is wired for `ax25d`: `accept()`
   blocks on a condvar (no busy-wait; `EAGAIN` under O_NONBLOCK), returns a child
   fd carrying the caller's callsign, and `getsockname()` reports the local port
   callsign in `fsa_digipeater[0]`.
-* **Receive back-pressure**: inbound bytes are never silently dropped — a
+* **Receive back-pressure**: inbound bytes are never silently dropped - a
   per-handle buffer plus a flusher thread drains into the socketpair as the app
   reads, without stalling the shared RHP reader thread.
 * **Connectionless UI** (`SOCK_DGRAM`): `socket → bind → sendto/recvfrom` maps to
@@ -113,8 +119,8 @@ mock RHP server:
   delivered whole through `recvfrom` with the source callsign filled, and all UI
   heard on the bound port is seen (promiscuous, matching pdn's dgram RX).
 
-Worked examples of every one of these paths — using only the standard `AF_AX25`
-socket API — live in [`samples/`](samples/) (connected client/listener, UI
+Worked examples of every one of these paths - using only the standard `AF_AX25`
+socket API - live in [`samples/`](samples/) (connected client/listener, UI
 beacon/monitor), with a "connected vs UI, when to use which" guide.
 
 Remaining `TODO(N1)` markers cover non-blocking niceties out of scope here (AX.25
