@@ -328,13 +328,121 @@ pub unsafe extern "C" fn ax25_config_get_desc(name: *const c_char) -> *mut c_cha
     }
 }
 
-/// `char *get_call(int uid)` — map a uid to a callsign via /proc/net/ax25.
+/// Default uid→callsign map path (override with env `AX25_CALLS` for testing).
+const DEFAULT_CALLS: &str = "/etc/ax25/ax25_calls";
+
+/// A parsed uid→callsign entry.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CallEntry {
+    pub uid: c_int,
+    pub call: String,
+}
+
+/// Parse a uid→callsign map file. Format: `uid callsign` per line; comments
+/// (`#`) and blank lines are skipped. Invalid lines are dropped silently.
+pub(crate) fn parse_calls(content: &str) -> Vec<CallEntry> {
+    let mut out: Vec<CallEntry> = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim_end_matches('\r');
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut rest = trimmed;
+        let uid_tok = pop_token(&mut rest);
+        let call_tok = pop_token(&mut rest);
+        let (uid_tok, call_tok) = match (uid_tok, call_tok) {
+            (Some(u), Some(c)) => (u, c),
+            _ => continue,
+        };
+        let Ok(uid) = uid_tok.parse::<c_int>() else {
+            continue;
+        };
+        let call = call_tok.to_ascii_uppercase();
+        if encode_entry(&call).is_none() {
+            continue;
+        }
+        if out.iter().any(|e| e.uid == uid) {
+            continue;
+        }
+        out.push(CallEntry { uid, call });
+    }
+    out
+}
+
+struct CCallEntry {
+    uid: c_int,
+    call: CString,
+}
+
+fn call_table() -> &'static Mutex<Vec<CCallEntry>> {
+    static TABLE: OnceLock<Mutex<Vec<CCallEntry>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn calls_path() -> String {
+    std::env::var("AX25_CALLS").unwrap_or_else(|_| DEFAULT_CALLS.to_string())
+}
+
+/// Load the uid→callsign table (idempotent).
+fn load_calls() {
+    let mut guard = call_table().lock().unwrap();
+    if !guard.is_empty() {
+        return;
+    }
+    let Ok(content) = std::fs::read_to_string(calls_path()) else {
+        return;
+    };
+    for e in parse_calls(&content) {
+        guard.push(CCallEntry {
+            uid: e.uid,
+            call: CString::new(e.call).unwrap_or_default(),
+        });
+    }
+}
+
+/// `char *get_call(int uid)` — map a uid to a callsign.
 ///
-/// TODO(N1): upstream reads /proc/net/ax25 + the ax25_calls table. There is no
-/// such proc file without the kernel stack; a future iteration should map uid
-/// via an axports/rhp lookup. For now this returns NULL (no mapping).
+/// Resolution order:
+/// 1. `AX25_CALLSIGN` env var (testing / single-user override).
+/// 2. `/etc/ax25/ax25_calls` (or `$AX25_CALLS`): `uid callsign` per line.
+/// 3. First port callsign from axports (single-operator station default).
+///
+/// Returns NULL only if no mapping can be resolved at all.
 #[no_mangle]
-pub extern "C" fn get_call(_uid: c_int) -> *mut c_char {
+pub extern "C" fn get_call(uid: c_int) -> *mut c_char {
+    // (1) Environment override — applies to any uid.
+    if let Ok(call) = std::env::var("AX25_CALLSIGN") {
+        if !call.is_empty() {
+            static ENV_CALL: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
+            let slot = ENV_CALL.get_or_init(|| Mutex::new(None));
+            let mut guard = slot.lock().unwrap();
+            if guard.is_none() {
+                *guard = CString::new(call).ok();
+            }
+            if let Some(ref cs) = *guard {
+                return cs.as_ptr() as *mut c_char;
+            }
+        }
+    }
+
+    // (2) Config-file lookup by uid.
+    load_calls();
+    {
+        let guard = call_table().lock().unwrap();
+        if let Some(entry) = guard.iter().find(|e| e.uid == uid) {
+            return entry.call.as_ptr() as *mut c_char;
+        }
+    }
+
+    // (3) Fallback: first axports port callsign.
+    {
+        let guard = ports().lock().unwrap();
+        if let Some(p) = guard.first() {
+            return p.call.as_ptr() as *mut c_char;
+        }
+    }
+
     std::ptr::null_mut()
 }
 
@@ -393,5 +501,49 @@ p2   M0LTE   9600 255 4 dup call
 ";
         let ports = parse_axports(input);
         assert_eq!(ports.len(), 1);
+    }
+
+    // ---- parse_calls tests ----
+
+    #[test]
+    fn parses_uid_callsign_lines() {
+        let input = "\
+# uid callsign
+1000 M0LTE-1
+1001 g0abc
+";
+        let entries = parse_calls(input);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].uid, 1000);
+        assert_eq!(entries[0].call, "M0LTE-1");
+        assert_eq!(entries[1].uid, 1001);
+        assert_eq!(entries[1].call, "G0ABC");
+    }
+
+    #[test]
+    fn skips_comments_blanks_and_invalid_lines() {
+        let input = "\
+# comment
+0 M0LTE
+
+notanum G0XYZ
+1000
+1001 !!!invalid!!!
+";
+        let entries = parse_calls(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uid, 0);
+        assert_eq!(entries[0].call, "M0LTE");
+    }
+
+    #[test]
+    fn rejects_duplicate_uid() {
+        let input = "\
+1000 M0LTE
+1000 G0XYZ
+";
+        let entries = parse_calls(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].call, "M0LTE");
     }
 }
