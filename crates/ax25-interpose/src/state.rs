@@ -115,6 +115,11 @@ pub fn resolve_connect_gate(handle: u64) {
                 break;
             }
         }
+        // The gate is gone and its filler is drained: it is now safe to start
+        // forwarding bypassed (stdio) writes for this non-blocking-connect handle.
+        // (Registering here — never earlier — keeps the outbound pump from ever
+        // seeing, and forwarding, the gate filler; issue #7.)
+        outbound_pump().register(handle, inner);
     }
 }
 
@@ -387,6 +392,151 @@ fn nb_write(inner_fd: c_int, data: &[u8]) -> WriteOutcome {
 }
 
 // ----------------------------------------------------------------------------
+// Outbound pump: forward app bytes that BYPASSED our write interposition.
+//
+// The app's AF_AX25 fd is one end of a socketpair we own. An app that writes via
+// a path LD_PRELOAD cannot intercept — glibc stdio (dprintf/fprintf/buffered
+// printf) flushes through the internal __write / __libc_write alias (a raw
+// write(2) syscall), deliberately bypassing an interposed public `write` symbol
+// (verified on glibc 2.39: an LD_PRELOAD probe hooking write/writev/send caught a
+// direct write(2) but NOT dprintf/fprintf) — still deposits its bytes into that
+// socketpair. Our interposed write()/send() route to RHP directly and never touch
+// the socketpair, so those bypassed bytes would sit unread and be lost (issue #7:
+// an ax25_answer dprintf() banner never reached the session). This pump drains
+// our end (inner_fd) and forwards them to the same RHP `send`, so a dprintf /
+// fprintf banner reaches the AX.25 session exactly like a direct write(2). One
+// mechanism covers write / writev / __write / the raw syscall at once, because
+// all of them land in the socketpair regardless of which symbol the app used.
+//
+// Ordering with the interposed (synchronous) write path is preserved by a
+// per-handle serializer: both this pump and ax25_send take it around the
+// "read socketpair -> RHP send" critical section, and ax25_send flushes any
+// pending bypassed bytes before emitting its own buffer, so interleaved
+// stdio-then-write() output stays in order.
+//
+// Registration happens only once a handle is fully established (accept, or a
+// resolved connect), never while a non-blocking connect's writability gate is
+// armed — that gate parks its filler in this very socketpair direction, so a pump
+// draining it then would forward filler as data and defeat the gate.
+// ----------------------------------------------------------------------------
+
+struct OutEntry {
+    inner_fd: c_int,
+    /// Serializes "read socketpair + forward to RHP" for this handle so the
+    /// background pump and a concurrent interposed write() cannot interleave
+    /// their forwards and reorder the session's byte stream.
+    serial: Arc<Mutex<()>>,
+}
+
+pub struct OutboundPump {
+    entries: Mutex<HashMap<u64, OutEntry>>,
+    cv: Condvar,
+}
+
+impl OutboundPump {
+    fn new() -> OutboundPump {
+        OutboundPump { entries: Mutex::new(HashMap::new()), cv: Condvar::new() }
+    }
+
+    /// Start forwarding bypassed writes on `inner_fd` for `handle`. Idempotent.
+    pub fn register(&self, handle: u64, inner_fd: c_int) {
+        let mut st = self.entries.lock().unwrap();
+        st.entry(handle)
+            .or_insert_with(|| OutEntry { inner_fd, serial: Arc::new(Mutex::new(())) });
+        self.cv.notify_all();
+    }
+
+    /// Forget a handle (its fd is being torn down).
+    pub fn unregister(&self, handle: u64) {
+        self.entries.lock().unwrap().remove(&handle);
+    }
+
+    fn lookup(&self, handle: u64) -> Option<(c_int, Arc<Mutex<()>>)> {
+        self.entries.lock().unwrap().get(&handle).map(|e| (e.inner_fd, e.serial.clone()))
+    }
+
+    /// Drain everything the app has written into the socketpair and forward it to
+    /// RHP, in order. The caller must hold the handle's `serial` lock.
+    fn drain_locked(client: &RhpClient, handle: u64, inner_fd: c_int) {
+        let recv = real::recv();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe {
+                recv(inner_fd, buf.as_mut_ptr() as *mut c_void, buf.len(), libc::MSG_DONTWAIT)
+            };
+            if n <= 0 {
+                break; // EAGAIN (nothing pending) or EOF/peer-gone: stop.
+            }
+            let _ = client.send(handle, &buf[..n as usize]);
+        }
+    }
+
+    /// Background flush for a handle whose inner fd poll() reported readable.
+    fn flush(&self, client: &RhpClient, handle: u64) {
+        if let Some((inner_fd, serial)) = self.lookup(handle) {
+            let _g = serial.lock().unwrap();
+            Self::drain_locked(client, handle, inner_fd);
+        }
+    }
+
+    /// Interposed-write path: flush any pending bypassed bytes, THEN send `data`,
+    /// all under the per-handle serializer so ordering with stdio output holds.
+    /// For an unregistered handle (e.g. mid-connect) it just sends `data`.
+    /// Returns an errno on failure.
+    pub fn send_ordered(&self, client: &RhpClient, handle: u64, data: &[u8]) -> Result<(), c_int> {
+        match self.lookup(handle) {
+            Some((inner_fd, serial)) => {
+                let _g = serial.lock().unwrap();
+                Self::drain_locked(client, handle, inner_fd);
+                client.send(handle, data).map_err(|e| e.to_errno())
+            }
+            None => client.send(handle, data).map_err(|e| e.to_errno()),
+        }
+    }
+}
+
+/// The shared outbound pump (starts its poller thread on first use).
+pub fn outbound_pump() -> &'static OutboundPump {
+    static M: OnceLock<OutboundPump> = OnceLock::new();
+    let pump = M.get_or_init(OutboundPump::new);
+    static START: Once = Once::new();
+    START.call_once(|| {
+        std::thread::Builder::new()
+            .name("ax25-outbound".into())
+            .spawn(|| outbound_loop(outbound_pump()))
+            .ok();
+    });
+    pump
+}
+
+fn outbound_loop(pump: &'static OutboundPump) {
+    loop {
+        // Snapshot the registered inner fds; park while none are registered.
+        let snapshot: Vec<(u64, c_int)> = {
+            let st = pump.entries.lock().unwrap();
+            let st = pump.cv.wait_while(st, |m| m.is_empty()).unwrap();
+            st.iter().map(|(&h, e)| (h, e.inner_fd)).collect()
+        };
+        let mut pfds: Vec<libc::pollfd> = snapshot
+            .iter()
+            .map(|&(_, fd)| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+            .collect();
+        // Timeout so newly-registered fds join the set promptly; POLLIN clears
+        // once drained, so this never busy-spins.
+        let n = unsafe { real::poll()(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 200) };
+        if n <= 0 {
+            continue;
+        }
+        let Some(client) = ensure_client() else { continue };
+        for (i, pfd) in pfds.iter().enumerate() {
+            if pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                pump.flush(&client, snapshot[i].0);
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Datagram pump: message-boundary-preserving delivery of inbound UI frames.
 //
 // A connected stream is a byte pipe, so RecvPump streams bytes into the
@@ -597,6 +747,7 @@ pub fn destroy_ax25_fd(fd: c_int) {
             // never write to (or a reused) fd behind our back.
             recv_pump().unregister(h);
             dgram_pump().unregister(h);
+            outbound_pump().unregister(h);
             connect_gates().lock().unwrap().remove(&h);
         }
         let close = real::close();
