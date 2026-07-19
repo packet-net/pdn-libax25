@@ -129,9 +129,12 @@ Worked examples of every one of these paths - using only the standard `AF_AX25`
 socket API - live in [`samples/`](samples/) (connected client/listener, UI
 beacon/monitor), with a "connected vs UI, when to use which" guide.
 
-Remaining `TODO(N1)` markers cover non-blocking niceties out of scope here (AX.25
-timer socket options captured as no-ops; connect-via-digipeater paths; the
-`libax25` `get_call` uid→callsign mapping).
+The former `TODO(N1)` items are now implemented: AX.25 timer/window socket
+options (T1/T2/T3/N2/EXTSEQ) are stored and returned via `getsockopt`
+(node-side-only until RHPv2 grows wire fields); connect-via-digipeater paths
+are parsed from `fsa_digipeater[]` and carried as a `via` field in the RHPv2
+`open` request; `get_call` resolves uid→callsign via `AX25_CALLSIGN` env,
+`/etc/ax25/ax25_calls`, or the first axports port as fallback.
 
 ## Licence
 
