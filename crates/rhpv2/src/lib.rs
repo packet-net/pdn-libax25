@@ -30,7 +30,7 @@
 //! let client = RhpClient::connect(sink.clone())?;
 //!
 //! // Place an outbound connected-mode call and stream some data.
-//! let conn = client.open_connect("MYCALL-1", "REMOTE-1")?;
+//! let conn = client.open_connect("MYCALL-1", "REMOTE-1", &[])?;
 //! if client.wait_connected(conn.handle, None).is_ok() {
 //!     client.send(conn.handle, b"hello over AX.25\r")?;
 //! }
