@@ -176,6 +176,7 @@ pub unsafe extern "C" fn connect(fd: c_int, addr: *const sockaddr, len: socklen_
         set_errno(libc::EINVAL);
         return -1;
     };
+    let digis = addr::read_digipeaters(addr, len);
 
     // A connect() on a connectionless UI socket has no handshake: it only records
     // a default destination so plain send()/write() (with no explicit dest) know
@@ -208,7 +209,7 @@ pub unsafe extern "C" fn connect(fd: c_int, addr: *const sockaddr, len: socklen_
     // the `open` was accepted; the link is not up until a status(Connected) push
     // (or it fails via a close push / error). So `open_connect` starts it, then
     // we wait for that transition — respecting O_NONBLOCK.
-    let res = match client.open_connect(&local, &remote) {
+    let res = match client.open_connect(&local, &remote, &digis) {
         Ok(res) => res,
         Err(e) => {
             set_errno(e.to_errno());
@@ -224,6 +225,7 @@ pub unsafe extern "C" fn connect(fd: c_int, addr: *const sockaddr, len: socklen_
         };
         s.handle = Some(res.handle);
         s.remote = Some(remote);
+        s.digis = digis;
         (s.app_fd, s.inner_fd)
     };
     state::recv_pump().register(res.handle, inner);

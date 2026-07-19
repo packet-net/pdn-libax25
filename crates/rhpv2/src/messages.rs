@@ -41,6 +41,8 @@ pub struct OpenReq<'a> {
     pub local: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<&'a str>,
     pub flags: u32,
 }
 
@@ -227,6 +229,7 @@ mod tests {
             port: None,
             local: "M0LTE",
             remote: Some("GB7RDG"),
+            via: None,
             flags: OPEN_FLAG_ACTIVE,
         };
         let s = serde_json::to_string(&req).unwrap();

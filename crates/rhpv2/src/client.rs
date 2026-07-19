@@ -396,18 +396,19 @@ impl RhpClient {
     /// AX.25 link is not up yet. The handle is registered as [`ConnPhase::Pending`];
     /// callers must [`wait_connected`](Self::wait_connected) (or poll
     /// [`connect_result`](Self::connect_result)) for the SABM/UA handshake.
-    pub fn open_connect(&self, local: &str, remote: &str) -> Result<OpenResult, RhpError> {
-        let res = self.open(local, Some(remote), OPEN_FLAG_ACTIVE)?;
+    pub fn open_connect(&self, local: &str, remote: &str, via: &[String]) -> Result<OpenResult, RhpError> {
+        let via_str = if via.is_empty() { None } else { Some(via.join(",")) };
+        let res = self.open(local, Some(remote), via_str.as_deref(), OPEN_FLAG_ACTIVE)?;
         self.conns.set_pending(res.handle);
         Ok(res)
     }
 
     /// Passive listener open (no remote, `flags:0`).
     pub fn open_listen(&self, local: &str) -> Result<OpenResult, RhpError> {
-        self.open(local, None, OPEN_FLAG_PASSIVE)
+        self.open(local, None, None, OPEN_FLAG_PASSIVE)
     }
 
-    fn open(&self, local: &str, remote: Option<&str>, flags: u32) -> Result<OpenResult, RhpError> {
+    fn open(&self, local: &str, remote: Option<&str>, via: Option<&str>, flags: u32) -> Result<OpenResult, RhpError> {
         let id = self.next_id();
         let req = OpenReq {
             typ: "open",
@@ -417,6 +418,7 @@ impl RhpClient {
             port: None,
             local,
             remote,
+            via,
             flags,
         };
         let bytes = serde_json::to_vec(&req).map_err(json_io)?;
@@ -796,7 +798,7 @@ mod tests {
         });
 
         let client = RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap();
-        let res = client.open_connect("M0LTE-1", "GB7RDG").unwrap();
+        let res = client.open_connect("M0LTE-1", "GB7RDG", &[]).unwrap();
         assert_eq!(res.handle, 42);
     }
 
@@ -817,7 +819,7 @@ mod tests {
 
         let sink = BufferingSink::new();
         let client = RhpClient::connect_to(addr, sink.clone()).unwrap();
-        let res = client.open_connect("M0LTE", "GB7RDG").unwrap();
+        let res = client.open_connect("M0LTE", "GB7RDG", &[]).unwrap();
         assert_eq!(res.handle, 7);
 
         // Give the push time to arrive.
@@ -840,7 +842,7 @@ mod tests {
         });
 
         let client = RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap();
-        let err = client.open_connect("M0LTE", "GB7RDG").unwrap_err();
+        let err = client.open_connect("M0LTE", "GB7RDG", &[]).unwrap_err();
         assert_eq!(err.to_errno(), libc::EAFNOSUPPORT);
     }
 
@@ -863,7 +865,7 @@ mod tests {
         });
 
         let client = Arc::new(RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap());
-        let res = client.open_connect("M0LTE", "GB7RDG").unwrap();
+        let res = client.open_connect("M0LTE", "GB7RDG", &[]).unwrap();
         assert_eq!(res.handle, 5);
 
         // openReply alone must NOT count as connected.
@@ -897,7 +899,7 @@ mod tests {
         });
 
         let client = RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap();
-        let res = client.open_connect("M0LTE", "GB7RDG").unwrap();
+        let res = client.open_connect("M0LTE", "GB7RDG", &[]).unwrap();
         assert_eq!(res.handle, 9);
 
         let outcome = client.wait_connected(9, Some(Duration::from_secs(5)));
@@ -926,7 +928,7 @@ mod tests {
         });
 
         let client = RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap();
-        let res = client.open_connect("M0LTE", "GB7RDG").unwrap();
+        let res = client.open_connect("M0LTE", "GB7RDG", &[]).unwrap();
         assert_eq!(res.handle, 4);
         assert_eq!(
             client.wait_connected(4, Some(Duration::from_secs(5))),
@@ -1080,7 +1082,7 @@ mod tests {
         });
 
         let client = RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap();
-        let res = client.open_connect("M0LTE", "GB7RDG").unwrap();
+        let res = client.open_connect("M0LTE", "GB7RDG", &[]).unwrap();
         // Blocking connect wakes with an error when the transport dies.
         assert!(client.wait_connected(res.handle, None).is_err());
         // A blocking accept on some listener also wakes (returns None).

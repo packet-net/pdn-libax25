@@ -101,6 +101,36 @@ pub unsafe fn read_call(addr: *const libc::sockaddr, len: libc::socklen_t) -> Op
     Some(decode(&sa.sax25_call.ax25_call))
 }
 
+/// Read the digipeater path from a raw `sockaddr` that is really a
+/// `full_sockaddr_ax25`. Returns an empty vec if the buffer is too small for
+/// digipeaters or `sax25_ndigis` is zero.
+pub unsafe fn read_digipeaters(addr: *const libc::sockaddr, len: libc::socklen_t) -> Vec<String> {
+    if addr.is_null() {
+        return Vec::new();
+    }
+    let base_len = std::mem::size_of::<SockaddrAx25>();
+    if (len as usize) < base_len {
+        return Vec::new();
+    }
+    let sa = &*(addr as *const SockaddrAx25);
+    let ndigis = sa.sax25_ndigis.max(0) as usize;
+    if ndigis == 0 {
+        return Vec::new();
+    }
+    let avail = (len as usize).saturating_sub(base_len);
+    let digi_size = std::mem::size_of::<Ax25Address>();
+    let max_fit = avail / digi_size;
+    let count = ndigis.min(max_fit).min(AX25_MAX_DIGIS);
+    if count == 0 {
+        return Vec::new();
+    }
+    let fsa = &*(addr as *const FullSockaddrAx25);
+    (0..count)
+        .map(|i| decode(&fsa.fsa_digipeater[i].ax25_call))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Write a callsign into a caller-provided `sockaddr` buffer as a
 /// `sockaddr_ax25`, updating `*len`. Used by getsockname / getpeername.
 pub unsafe fn write_call(

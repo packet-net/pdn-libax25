@@ -25,6 +25,8 @@ pub struct FdState {
     pub local: Option<String>,
     /// Remote (peer) callsign.
     pub remote: Option<String>,
+    /// Digipeater path (via calls) from the app's full_sockaddr_ax25.
+    pub digis: Vec<String>,
     /// True once this fd is an RHP listener.
     pub listening: bool,
     /// True if this is a connectionless UI socket (SOCK_DGRAM) rather than a
@@ -735,6 +737,7 @@ pub fn create_ax25_fd(dgram: bool) -> Option<c_int> {
             handle: None,
             local: None,
             remote: None,
+            digis: Vec::new(),
             listening: false,
             dgram,
             pidincl: false,
