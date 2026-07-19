@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // Thin no-op / stub exports for the remainder of the ve7fet libax25 ABI, so
 // that binaries linked against `-lax25` resolve every symbol they reference.

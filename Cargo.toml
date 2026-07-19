@@ -1,15 +1,15 @@
 # pdn-libax25 Cargo workspace.
 #
-# Licence: LGPL-3.0-or-later (see COPYING.LESSER / COPYING).
+# Licence: AGPL-3.0-or-later (see COPYING).
 #
 # Three crates:
-#   rhp             - RHPv2-over-TCP client (shared internal library)
+#   rhpv2           - RHPv2-over-TCP client (published crate; also used internally)
 #   libax25         - drop-in replacement for ve7fet libax25 helper lib (cdylib)
 #   ax25-interpose  - LD_PRELOAD libc interposer routing AF_AX25 to pdn (cdylib)
 [workspace]
 resolver = "2"
 members = [
-    "crates/rhp",
+    "crates/rhpv2",
     "crates/libax25",
     "crates/ax25-interpose",
 ]
@@ -17,7 +17,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "LGPL-3.0-or-later"
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/packet-net/pdn-libax25"
 rust-version = "1.74"
 

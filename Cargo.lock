@@ -7,7 +7,7 @@ name = "ax25-interpose"
 version = "0.1.0"
 dependencies = [
  "libc",
- "rhp",
+ "rhpv2",
 ]
 
 [[package]]
@@ -21,7 +21,7 @@ name = "libax25"
 version = "0.1.0"
 dependencies = [
  "libc",
- "rhp",
+ "rhpv2",
 ]
 
 [[package]]
@@ -55,7 +55,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rhp"
+name = "rhpv2"
 version = "0.1.0"
 dependencies = [
  "libc",

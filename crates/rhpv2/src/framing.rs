@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // RHPv2 framing: a 2-byte big-endian length prefix followed by that many bytes
 // of UTF-8 JSON. Maximum frame body is 65535 bytes.
