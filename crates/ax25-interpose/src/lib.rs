@@ -40,13 +40,18 @@ use libc::{c_int, c_void, size_t, sockaddr, socklen_t, ssize_t};
 use state::DgramOutcome;
 use std::time::Duration;
 
-// AX.25 setsockopt option names we care about (from <netax25/ax25.h>).
+// AX.25 setsockopt option names (from <netax25/ax25.h>).
 const AX25_WINDOW: c_int = 1;
-const AX25_PACLEN: c_int = 10;
+const AX25_T1: c_int = 2;
+const AX25_N2: c_int = 3;
+const AX25_T3: c_int = 4;
+const AX25_T2: c_int = 5;
+const AX25_EXTSEQ: c_int = 7;
 /// AX25_PIDINCL (option 8): when set, the app's buffer carries the AX.25 PID as
 /// its first byte on send, and recv prepends the PID byte — the kernel AF_AX25
 /// convention used to send e.g. IP (PID 0xCC) over a datagram socket.
 const AX25_PIDINCL: c_int = 8;
+const AX25_PACLEN: c_int = 10;
 
 /// Default AX.25 PID for UI frames: 0xF0 = "no Layer 3", the beacon/APRS default.
 const AX25_PID_NO_L3: i64 = 0xF0;
@@ -374,8 +379,9 @@ pub unsafe extern "C" fn getpeername(fd: c_int, addr: *mut sockaddr, len: *mut s
 /// `int setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen)`.
 ///
 /// For AX.25 fds we ALWAYS return 0 — apps (e.g. ax25_config-driven ones) treat
-/// a setsockopt failure as fatal. WINDOW/PACLEN are captured for a future OPEN;
-/// the rest are accepted and ignored.
+/// a setsockopt failure as fatal. WINDOW/PACLEN/T1/T2/T3/N2/EXTSEQ are stored
+/// and returned by getsockopt; only WINDOW/PACLEN are forwarded on OPEN (RHPv2
+/// has no wire fields for the timers, so they are node-side-only).
 #[no_mangle]
 pub unsafe extern "C" fn setsockopt(
     fd: c_int,
@@ -395,7 +401,12 @@ pub unsafe extern "C" fn setsockopt(
                     AX25_WINDOW => s.window = Some(v),
                     AX25_PACLEN => s.paclen = Some(v),
                     AX25_PIDINCL => s.pidincl = v != 0,
-                    _ => { /* T1/T2/T3/N2/EXTSEQ/... captured as no-ops (TODO(N1)) */ }
+                    AX25_T1 => s.t1 = Some(v),
+                    AX25_T2 => s.t2 = Some(v),
+                    AX25_T3 => s.t3 = Some(v),
+                    AX25_N2 => s.n2 = Some(v),
+                    AX25_EXTSEQ => s.extseq = Some(v),
+                    _ => { /* remaining options accepted, node-side-only */ }
                 }
             }
         }
@@ -409,7 +420,8 @@ pub unsafe extern "C" fn setsockopt(
 /// The one option we must implement for AX.25 fds is `SOL_SOCKET`/`SO_ERROR`:
 /// the non-blocking-connect idiom reads it (once the fd is writable) to collect
 /// the pending connect result (0 on success, an errno on failure). Other
-/// SOL_SOCKET options are served by the real socketpair; SOL_AX25 gets report 0.
+/// SOL_SOCKET options are served by the real socketpair; SOL_AX25 returns the
+/// stored per-fd value (set via setsockopt) or 0 if unset.
 #[no_mangle]
 pub unsafe extern "C" fn getsockopt(
     fd: c_int,
@@ -434,9 +446,21 @@ pub unsafe extern "C" fn getsockopt(
             return 0;
         }
         if level == SOL_AX25 {
-            // Report success with a zeroed value; app AX.25 gets are advisory.
             if !optval.is_null() && !optlen.is_null() && (*optlen as usize) >= std::mem::size_of::<c_int>() {
-                *(optval as *mut c_int) = 0;
+                let val: c_int = state::fds().lock().unwrap().get(&fd).map(|s| {
+                    match optname {
+                        AX25_WINDOW => s.window.unwrap_or(0) as c_int,
+                        AX25_PACLEN => s.paclen.unwrap_or(0) as c_int,
+                        AX25_T1 => s.t1.unwrap_or(0) as c_int,
+                        AX25_T2 => s.t2.unwrap_or(0) as c_int,
+                        AX25_T3 => s.t3.unwrap_or(0) as c_int,
+                        AX25_N2 => s.n2.unwrap_or(0) as c_int,
+                        AX25_EXTSEQ => s.extseq.unwrap_or(0) as c_int,
+                        AX25_PIDINCL => s.pidincl as c_int,
+                        _ => 0,
+                    }
+                }).unwrap_or(0);
+                *(optval as *mut c_int) = val;
                 *optlen = std::mem::size_of::<c_int>() as socklen_t;
             }
             return 0;
