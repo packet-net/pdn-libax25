@@ -858,12 +858,14 @@ mod e2e_tests {
 
     /// A request-driven mock RHP server. Correlates replies by `id`; injects
     /// status/accept pushes after `PUSH_DELAY`. Returns its `host:port`.
-    fn spawn_mock() -> (String, Arc<Mutex<Vec<Frame>>>) {
-        // Captures every `sendto` the interposer emits, for assertion.
+    fn spawn_mock() -> (String, Arc<Mutex<Vec<Frame>>>, Arc<Mutex<Vec<Frame>>>) {
+        // Captures every `sendto` (UI) and `send` (connected) the interposer emits.
         let sendtos: Arc<Mutex<Vec<Frame>>> = Arc::new(Mutex::new(Vec::new()));
+        let sends: Arc<Mutex<Vec<Frame>>> = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let sendtos_srv = sendtos.clone();
+        let sends_srv = sends.clone();
         std::thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
             let mut reader = sock.try_clone().unwrap();
@@ -923,6 +925,11 @@ mod e2e_tests {
                         sendtos_srv.lock().unwrap().push(f.clone());
                         reply(&writer, id, None);
                     }
+                    "send" => {
+                        // Record the emitted connected-mode data frame, then ack.
+                        sends_srv.lock().unwrap().push(f.clone());
+                        reply(&writer, id, None);
+                    }
                     "listen" => {
                         let lh = f.handle().unwrap();
                         reply(&writer, id, None);
@@ -937,12 +944,12 @@ mod e2e_tests {
                             let _ = write_frame(&mut *w.lock().unwrap(), push.as_bytes());
                         });
                     }
-                    // bind / send / close / anything else: bare ack.
+                    // bind / close / anything else: bare ack.
                     _ => reply(&writer, id, None),
                 }
             }
         });
-        (addr, sendtos)
+        (addr, sendtos, sends)
     }
 
     fn poll_writable(fd: c_int, timeout_ms: c_int) -> bool {
@@ -953,7 +960,7 @@ mod e2e_tests {
 
     #[test]
     fn interposer_connect_and_accept_end_to_end() {
-        let (mock_addr, sendtos) = spawn_mock();
+        let (mock_addr, sendtos, sends) = spawn_mock();
         std::env::set_var("PDN_RHP_ADDR", mock_addr);
 
         // ---- (a) blocking connect unblocks only after status(Connected) ----
@@ -1054,6 +1061,20 @@ mod e2e_tests {
             0
         );
         assert_eq!(addr::decode(&me.fsa_digipeater[0].ax25_call), "GB7RDG-1");
+
+        // ---- (c2) accepting-side early send (issue #4, accepting side) --------
+        // A banner written to the child fd IMMEDIATELY after accept() — before any
+        // inbound recv on the child — must be emitted as an RHP `send`, not gated
+        // on a first inbound frame. (The connecting-side counterpart, an early
+        // recv arriving before the fd registers, is covered by the deterministic
+        // state::tests::early_recv_before_register_is_delivered_not_dropped.)
+        let banner = "Welcome to GB7RDG BBS";
+        let wn = unsafe { crate::write(child, banner.as_ptr() as *const c_void, banner.len()) };
+        assert_eq!(wn, banner.len() as isize, "child write failed (errno {})", errno());
+        assert!(
+            sends.lock().unwrap().iter().any(|f| f.data_str() == Some(banner)),
+            "accepting-side banner was not emitted as an RHP send"
+        );
 
         unsafe { crate::close(child) };
         unsafe { crate::close(lfd) };
