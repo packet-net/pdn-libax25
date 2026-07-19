@@ -1,0 +1,21 @@
+#!/bin/sh
+# pdn-ax25 — run any AF_AX25 application with the pdn-libax25 shim active.
+#
+# pdn-libax25 is OPT-IN: its .so artifacts live in the PRIVATE path
+# /usr/lib/pdn-libax25/ and are NOT on the default library search path, so they
+# never hijack the system's AX.25. This wrapper turns the shim on for exactly the
+# one command you run through it, and nothing else:
+#
+#   * LD_LIBRARY_PATH gains /usr/lib/pdn-libax25 so `-lax25` resolves against our
+#     libax25.so.1 (the axports-parsing helper) ahead of any distro package.
+#   * LD_PRELOAD gains ax25-interpose.so so AF_AX25 sockets are routed to a pdn
+#     node over RHPv2 (default 127.0.0.1:9000; override with PDN_RHP_ADDR).
+#
+# Usage:
+#   pdn-ax25 <command> [args...]
+# e.g.:
+#   PDN_RHP_ADDR=127.0.0.1:9000 pdn-ax25 axcall radio GB7RDG
+#
+# See /usr/share/doc/pdn-libax25/ for the full usage notes.
+exec env LD_LIBRARY_PATH="/usr/lib/pdn-libax25:${LD_LIBRARY_PATH}" \
+         LD_PRELOAD="/usr/lib/pdn-libax25/ax25-interpose.so:${LD_PRELOAD}" "$@"

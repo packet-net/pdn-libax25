@@ -1,0 +1,10 @@
+# Cross-linker config so `cargo build --release --target <t>` links the cdylibs
+# with the matching GNU toolchain. amd64 is native (no entry needed); arm64 and
+# armhf cross-compile from an x86_64 host with the gcc-*-linux-gnu* linkers.
+# See scripts/build-deb.sh and .github/workflows/release.yml.
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[target.arm-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"

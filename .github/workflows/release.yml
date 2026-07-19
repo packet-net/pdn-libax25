@@ -1,0 +1,82 @@
+name: release
+
+# On a `v*` tag: build the two pdn-libax25 cdylibs for each architecture, package
+# per-arch .debs, and attach them (+ SHA256SUMS) to a GitHub Release. No apt repo.
+#
+# Self-hosted x64 only (org convention — no GitHub-hosted runners). arm64 (and, best
+# effort, armhf) cross-compile from x64 via the .cargo/config.toml linkers, so no
+# arch-native runner is needed. scripts/build-deb.sh does the build + packaging.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version without the v prefix, e.g. 0.1.0'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: v
+        name: Resolve version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install cross toolchains
+        # amd64 is native. arm64 is a required target; armhf is best-effort (see below).
+        run: |
+          set -eu
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y gcc-aarch64-linux-gnu
+          # armhf: attempt it, but never let it block the release.
+          rustup target add arm-unknown-linux-gnueabihf || echo "::warning::armhf rust target add failed — armhf will be skipped"
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y gcc-arm-linux-gnueabihf || echo "::warning::armhf gcc install failed — armhf will be skipped"
+
+      - name: Build per-arch .debs
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -eu
+          # amd64 + arm64 are REQUIRED — a failure here fails the release.
+          for arch in amd64 arm64; do
+            scripts/build-deb.sh "$arch" "$VERSION"
+          done
+          # armhf is BEST-EFFORT — build it if the toolchain is present, but a failure
+          # must not block the release (task pin: ship amd64+arm64, armhf as follow-up).
+          if scripts/build-deb.sh armhf "$VERSION"; then
+            echo "armhf built"
+          else
+            echo "::warning::armhf .deb build failed — releasing amd64 + arm64 only"
+          fi
+
+      - name: Checksums + GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -eu
+          cd artifacts
+          sha256sum pdn-libax25_*.deb > SHA256SUMS
+          ls -l pdn-libax25_*.deb SHA256SUMS
+          cd ..
+          gh release create "v${VERSION}" \
+            artifacts/pdn-libax25_*.deb artifacts/SHA256SUMS \
+            --repo "${{ github.repository }}" \
+            --title "pdn-libax25 v${VERSION}" \
+            --notes "AF_AX25 seam for the pdn AX.25 stack — an **opt-in** LD_PRELOAD shim (LGPL-3.0). Install the \`.deb\` for your arch: \`sudo apt install ./pdn-libax25_${VERSION}_<arch>.deb\`. It lands in the private path \`/usr/lib/pdn-libax25/\` (never hijacks system AX.25) and ships a \`pdn-ax25\` wrapper — run any AF_AX25 app through it, e.g. \`PDN_RHP_ADDR=127.0.0.1:9000 pdn-ax25 axcall radio GB7RDG\`. \`SHA256SUMS\` covers the .debs. Requires a running pdn node reachable over RHPv2 (\`Recommends: packetnet\`, not a hard dependency)."

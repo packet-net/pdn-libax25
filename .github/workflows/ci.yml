@@ -1,0 +1,31 @@
+name: ci
+
+# Build + test + lint on every push to main (and on demand). Self-hosted x64 only
+# (org convention — no GitHub-hosted runners). PRs merge on green LOCAL test runs;
+# the push-to-main run is the CI signal.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        # Report-only (no `-D warnings`): the repo had no CI, so it carries some
+        # pre-existing clippy lints. Run clippy for signal without failing the build
+        # on them; promote to `-- -D warnings` once the backlog is cleared.
+        run: cargo clippy --all-targets

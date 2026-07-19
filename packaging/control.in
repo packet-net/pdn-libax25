@@ -1,0 +1,20 @@
+Package: pdn-libax25
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: Tom Fanning <tom@m0lte.uk>
+Depends: libc6
+Recommends: packetnet
+Section: hamradio
+Priority: optional
+Homepage: https://github.com/packet-net/pdn-libax25
+Description: AF_AX25 seam for the pdn AX.25 stack (opt-in LD_PRELOAD shim)
+ Lets unmodified Linux ham-radio applications (ax25-apps, ax25-tools, FBB, ...)
+ use the pdn AX.25 stack (packet.net) instead of the Linux kernel AF_AX25 stack,
+ which was removed from mainline in Linux 7.1.
+ .
+ Ships two native LGPL-3.0 artifacts into the PRIVATE path /usr/lib/pdn-libax25/
+ (never the default library path, so system AX.25 is not hijacked):
+ libax25.so.1, a drop-in for ve7fet libax25's helper/axports ABI; and
+ ax25-interpose.so, an LD_PRELOAD libc interposer that routes AF_AX25 sockets to
+ a pdn node over RHPv2. Turn the shim on per-command with the pdn-ax25 wrapper,
+ e.g. `pdn-ax25 axcall radio GB7RDG`. Loosely coupled to the node over RHPv2.
