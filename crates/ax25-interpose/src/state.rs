@@ -139,27 +139,58 @@ struct PendingRecv {
     eof_done: bool,
 }
 
+/// Cap on bytes staged per handle before its fd registers. The early window is
+/// tiny (one banner between `open_connect` returning and `register`), so this is
+/// a pure safety bound against a handle that receives but never registers; real
+/// sessions never approach it.
+const EARLY_STAGE_CAP: usize = 256 * 1024;
+
+/// The pump's shared state: live handles plus a small staging area for recv
+/// bytes that arrived before their handle registered (issue #4). Both live under
+/// one mutex so a push and its handle's `register` are ordered atomically — the
+/// reason they are one struct rather than two maps.
+#[derive(Default)]
+struct PumpState {
+    /// Registered handles with a live socketpair fd, keyed by RHP handle.
+    handles: HashMap<u64, PendingRecv>,
+    /// Recv bytes that arrived BEFORE the owning fd registered, per handle. Folded
+    /// into `handles` at `register` time so a session's first inbound frame (e.g.
+    /// a server banner emitted the instant the link comes up) is never dropped.
+    early: HashMap<u64, VecDeque<u8>>,
+}
+
 pub struct RecvPump {
-    state: Mutex<HashMap<u64, PendingRecv>>,
+    state: Mutex<PumpState>,
     cv: Condvar,
 }
 
 impl RecvPump {
     fn new() -> RecvPump {
-        RecvPump { state: Mutex::new(HashMap::new()), cv: Condvar::new() }
+        RecvPump { state: Mutex::new(PumpState::default()), cv: Condvar::new() }
     }
 
-    /// Register a handle's inner socketpair fd for recv delivery.
+    /// Register a handle's inner socketpair fd for recv delivery, folding in any
+    /// bytes that raced ahead of registration so the first inbound frame of a
+    /// freshly-established session is delivered rather than dropped (issue #4).
     pub fn register(&self, handle: u64, inner_fd: c_int) {
-        self.state.lock().unwrap().insert(
+        let mut st = self.state.lock().unwrap();
+        let staged = st.early.remove(&handle).unwrap_or_default();
+        let had_staged = !staged.is_empty();
+        st.handles.insert(
             handle,
-            PendingRecv { inner_fd, buf: VecDeque::new(), eof: false, eof_done: false },
+            PendingRecv { inner_fd, buf: staged, eof: false, eof_done: false },
         );
+        if had_staged {
+            // Wake the flusher to push the staged backlog into the socketpair.
+            self.cv.notify_all();
+        }
     }
 
     /// Forget a handle (its fd is being torn down by the owner).
     pub fn unregister(&self, handle: u64) {
-        self.state.lock().unwrap().remove(&handle);
+        let mut st = self.state.lock().unwrap();
+        st.handles.remove(&handle);
+        st.early.remove(&handle);
     }
 
     /// Deliver inbound bytes, buffering whatever the socketpair cannot take now.
@@ -168,8 +199,18 @@ impl RecvPump {
             return;
         }
         let mut st = self.state.lock().unwrap();
-        let Some(e) = st.get_mut(&handle) else {
-            return; // fd already gone
+        let Some(e) = st.handles.get_mut(&handle) else {
+            // Not registered yet: the owning fd hasn't finished wiring its
+            // socketpair (connect()/accept() register only after the open/accept
+            // resolves, so a banner push can beat the register). Stage the bytes
+            // for register() to fold in — dropping them here loses the session's
+            // first frame (issue #4). Bounded by EARLY_STAGE_CAP.
+            let q = st.early.entry(handle).or_default();
+            let room = EARLY_STAGE_CAP.saturating_sub(q.len());
+            if room > 0 {
+                q.extend(data.iter().take(room).copied());
+            }
+            return;
         };
         let mut dead = false;
         if e.buf.is_empty() {
@@ -193,13 +234,13 @@ impl RecvPump {
             self.cv.notify_all();
         }
         if dead {
-            st.remove(&handle);
+            st.handles.remove(&handle);
         }
     }
 
     /// Note a server-initiated close; EOF is signalled after the backlog drains.
     pub fn mark_eof(&self, handle: u64) {
-        if let Some(e) = self.state.lock().unwrap().get_mut(&handle) {
+        if let Some(e) = self.state.lock().unwrap().handles.get_mut(&handle) {
             e.eof = true;
             self.cv.notify_all();
         }
@@ -208,7 +249,7 @@ impl RecvPump {
     /// Transport gone: EOF every live handle (after flushing what it can).
     pub fn shutdown_all(&self) {
         let mut st = self.state.lock().unwrap();
-        for e in st.values_mut() {
+        for e in st.handles.values_mut() {
             e.eof = true;
         }
         self.cv.notify_all();
@@ -221,7 +262,7 @@ impl RecvPump {
         let mut blocked = Vec::new();
         let mut dead: Vec<u64> = Vec::new();
         let mut st = self.state.lock().unwrap();
-        for (&handle, e) in st.iter_mut() {
+        for (&handle, e) in st.handles.iter_mut() {
             let mut fatal = false;
             while !e.buf.is_empty() {
                 let (front, _) = e.buf.as_slices();
@@ -250,7 +291,7 @@ impl RecvPump {
             }
         }
         for h in dead {
-            st.remove(&h);
+            st.handles.remove(&h);
         }
         blocked
     }
@@ -259,6 +300,7 @@ impl RecvPump {
         self.state
             .lock()
             .unwrap()
+            .handles
             .values()
             .any(|e| !e.buf.is_empty() || (e.eof && !e.eof_done))
     }
@@ -285,7 +327,9 @@ fn flusher_loop(pump: &'static RecvPump) {
             let st = pump.state.lock().unwrap();
             let _guard = pump
                 .cv
-                .wait_while(st, |m| !m.values().any(|e| !e.buf.is_empty() || (e.eof && !e.eof_done)))
+                .wait_while(st, |m| {
+                    !m.handles.values().any(|e| !e.buf.is_empty() || (e.eof && !e.eof_done))
+                })
                 .unwrap();
         }
         // Drain as much as possible, then wait for the app to make room.
@@ -653,6 +697,57 @@ mod tests {
 
         assert_eq!(got.len(), total, "lost data under back-pressure");
         assert_eq!(got, data, "data reordered/corrupted under back-pressure");
+
+        pump.unregister(handle);
+        unsafe {
+            libc::close(app_fd);
+            libc::close(inner_fd);
+        }
+    }
+
+    /// Issue #4 (packet.net#653): the connecting-side banner race.
+    ///
+    /// When an inbound session comes up, the peer (a BBS/node) writes its banner
+    /// the instant the link is established. That banner reaches us as a `recv`
+    /// push on the RHP reader thread — which calls `recv_pump().push(handle, ..)`.
+    /// But `connect()` only calls `recv_pump().register(handle, inner_fd)` *after*
+    /// `open_connect()` returns, so a fast banner push can arrive BEFORE the
+    /// handle is registered. This test models exactly that ordering: push first,
+    /// register second. The banner must survive to the app's `read()`.
+    ///
+    /// Before the fix, `push` hit the `// fd already gone` arm and silently
+    /// dropped the bytes, so the app blocked forever / got EOF with no banner.
+    #[test]
+    fn early_recv_before_register_is_delivered_not_dropped() {
+        let mut sv = [0 as c_int; 2];
+        let r = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(r, 0, "socketpair failed");
+        let (app_fd, inner_fd) = (sv[0], sv[1]);
+
+        let handle: u64 = 0x5EED_0004;
+        let pump = recv_pump();
+
+        // The banner arrives as a recv push BEFORE the fd registers — the reader
+        // thread raced ahead of connect()'s recv_pump().register().
+        let banner = b"login: ";
+        pump.push(handle, banner);
+
+        // connect() registers only now, after open_connect() returned.
+        pump.register(handle, inner_fd);
+
+        // The app's read() must see the banner. Poll first (bounded), so a
+        // regression fails the assert via timeout instead of hanging the test.
+        let mut pfd = libc::pollfd { fd: app_fd, events: libc::POLLIN, revents: 0 };
+        let pn = unsafe { libc::poll(&mut pfd, 1, 2000) };
+        assert!(
+            pn > 0 && (pfd.revents & libc::POLLIN) != 0,
+            "banner never delivered — early recv push was dropped (issue #4)"
+        );
+
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(app_fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+        assert!(n > 0, "read returned {n}");
+        assert_eq!(&buf[..n as usize], banner, "wrong/lost banner bytes");
 
         pump.unregister(handle);
         unsafe {
