@@ -12,7 +12,10 @@
 // Model: an AX.25 socket is backed by a real `socketpair` so the app's
 // select/poll/read keep working with real libc; a background reader thread in
 // the `rhp` client writes inbound data into our end of the pair, and our
-// write/send wrappers forward outbound data to RHP `send`.
+// write/send wrappers forward outbound data to RHP `send`. Writes we cannot
+// interpose (glibc stdio — dprintf/fprintf — flushes via the non-interposable
+// __write alias / raw syscall) still land in the socketpair, so an OutboundPump
+// drains our end and forwards them to the same RHP `send` (issue #7).
 //
 // STATUS: both directions are implemented.
 //   * Outbound: connect() waits for the async status(Connected) push (blocking),
@@ -237,7 +240,12 @@ pub unsafe extern "C" fn connect(fd: c_int, addr: *const sockaddr, len: socklen_
 
     // Blocking connect: park until the link comes up or fails.
     match client.wait_connected(res.handle, Some(CONNECT_TIMEOUT)) {
-        Ok(()) => 0,
+        Ok(()) => {
+            // Link is up (and never gated on the blocking path): start forwarding
+            // bypassed stdio/dprintf writes from the socketpair to RHP (issue #7).
+            state::outbound_pump().register(res.handle, inner);
+            0
+        }
         Err(errno) => {
             set_errno(errno);
             -1
@@ -311,6 +319,10 @@ pub unsafe extern "C" fn accept(fd: c_int, addr: *mut sockaddr, len: *mut sockle
         s.inner_fd
     };
     state::recv_pump().register(info.child_handle, inner);
+    // Forward any writes that bypass our interposition (stdio/dprintf flush via
+    // the non-interposable __write) from the socketpair to RHP (issue #7). A child
+    // socket is never gated, so it is safe to register immediately.
+    state::outbound_pump().register(info.child_handle, inner);
 
     // Fill the returned peer sockaddr with the caller's callsign.
     if let Some(remote) = &info.remote {
@@ -558,10 +570,13 @@ unsafe fn ax25_send(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
         return -1;
     };
     let data = std::slice::from_raw_parts(buf as *const u8, count);
-    match client.send(handle, data) {
+    // Route through the outbound pump so any bytes the app wrote via a path we
+    // could not interpose (stdio/dprintf flush) are flushed to RHP *before* this
+    // buffer — keeping an interleaved stdio-then-write() stream in order (issue #7).
+    match state::outbound_pump().send_ordered(&client, handle, data) {
         Ok(()) => count as ssize_t,
-        Err(e) => {
-            set_errno(e.to_errno());
+        Err(errno) => {
+            set_errno(errno);
             -1
         }
     }
@@ -1083,6 +1098,38 @@ mod e2e_tests {
         assert!(
             sends.lock().unwrap().iter().any(|f| f.data_str() == Some(banner)),
             "accepting-side banner was not emitted as an RHP send"
+        );
+
+        // ---- (c3) issue #7: a dprintf/stdio banner reaches RHP send -----------
+        // glibc stdio (dprintf/fprintf/buffered printf) flushes through the
+        // internal __write alias / raw write(2) syscall, which LD_PRELOAD of the
+        // public `write` symbol CANNOT intercept (verified on glibc 2.39). We call
+        // the REAL glibc dprintf here so this exercises exactly that
+        // non-interposable path against the child's socketpair fd. The bytes still
+        // land in our socketpair; the OutboundPump must drain them to RHP `send`.
+        // Before the fix these bytes were never forwarded and this timed out.
+        extern "C" {
+            fn dprintf(fd: c_int, fmt: *const libc::c_char, ...) -> c_int;
+        }
+        let stdio_banner = "STDIO-BANNER via dprintf\n";
+        let fmt = std::ffi::CString::new("%s").unwrap();
+        let arg = std::ffi::CString::new(stdio_banner).unwrap();
+        let dn = unsafe { dprintf(child, fmt.as_ptr(), arg.as_ptr()) };
+        assert_eq!(dn as usize, stdio_banner.len(), "dprintf wrote {dn} bytes");
+        // The OutboundPump forwards asynchronously; wait (bounded) for the mock.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = false;
+        while Instant::now() < deadline {
+            if sends.lock().unwrap().iter().any(|f| f.data_str() == Some(stdio_banner)) {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            seen,
+            "issue #7: a dprintf (stdio) banner never reached RHP send — the \
+             OutboundPump did not drain the bypassed write from the socketpair"
         );
 
         unsafe { crate::close(child) };
