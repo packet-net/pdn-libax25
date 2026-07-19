@@ -92,8 +92,8 @@ pub unsafe extern "C" fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_
 ///
 /// For a connected (SEQPACKET) socket this just records the local callsign for a
 /// later connect/listen. For a connectionless (DGRAM/UI) socket it eagerly opens
-/// the RHP `dgram` handle and binds the callsign (port null = all ports), so the
-/// engine starts delivering inbound UI on that port to us.
+/// the RHP `custom`-mode handle and binds the callsign (port null = all ports), so
+/// the engine starts delivering inbound UI on that port to us.
 #[no_mangle]
 pub unsafe extern "C" fn bind(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
     if !state::is_ax25_fd(fd) {
@@ -571,8 +571,8 @@ unsafe fn ax25_send(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
 // Connectionless UI (SOCK_DGRAM) helpers.
 // ----------------------------------------------------------------------------
 
-/// Ensure a dgram fd has an RHP `dgram` handle (opening + binding it on first
-/// use), registered with the datagram pump for RX. Returns the handle or an
+/// Ensure a dgram fd has an RHP `custom`-mode handle (opening + binding it on
+/// first use), registered with the datagram pump for RX. Returns the handle or an
 /// errno. Idempotent: a second call just returns the existing handle.
 unsafe fn ensure_dgram_handle(fd: c_int) -> Result<u64, c_int> {
     // Fast path: handle already allocated.
@@ -679,19 +679,21 @@ unsafe fn ax25_dgram_send(
         .or_else(|| std::env::var("AX25_SRC_CALL").ok())
         .unwrap_or_else(|| "NOCALL".to_string());
 
-    // PID handling: default 0xF0, unless AX25_PIDINCL means byte 0 is the PID.
+    // Custom mode carries the PID as data[0]. With AX25_PIDINCL the app's buffer
+    // is already [PID][info…] and is sent as-is (the natural fit); otherwise
+    // prepend the default 0xF0 (no Layer 3) -> [0xF0] ++ app.
     let app = std::slice::from_raw_parts(buf as *const u8, count);
-    let (pid, data): (i64, &[u8]) = if pidincl {
-        if app.is_empty() {
-            set_errno(libc::EINVAL); // no room even for the PID byte
-            return -1;
-        }
-        (app[0] as i64, &app[1..])
+    let wire: Vec<u8> = if pidincl {
+        app.to_vec()
     } else {
-        (AX25_PID_NO_L3, app)
+        let mut v = Vec::with_capacity(app.len() + 1);
+        v.push(AX25_PID_NO_L3 as u8);
+        v.extend_from_slice(app);
+        v
     };
-    if data.is_empty() {
-        // pdn rejects an empty AX.25 UI frame (errCode 1); fail locally.
+    if wire.is_empty() {
+        // pdn rejects empty custom `data` (errCode 1); under PIDINCL there is not
+        // even room for the PID octet. Fail locally.
         set_errno(libc::EINVAL);
         return -1;
     }
@@ -700,7 +702,7 @@ unsafe fn ax25_dgram_send(
         set_errno(libc::EIO);
         return -1;
     };
-    match client.sendto(handle, &remote, &local, Some(pid), data) {
+    match client.sendto(handle, &remote, &local, &wire) {
         // Report the whole app buffer consumed (incl. the PID byte if PIDINCL).
         Ok(()) => count as ssize_t,
         Err(e) => {
@@ -733,15 +735,16 @@ unsafe fn ax25_dgram_recv(
     loop {
         match state::dgram_pump().recv_one(handle) {
             DgramOutcome::Got(dg) => {
-                // Assemble the returned payload, PID byte first if PIDINCL.
-                let mut out: Vec<u8> = Vec::with_capacity(dg.data.len() + 1);
-                if pidincl {
-                    out.push((dg.pid.unwrap_or(AX25_PID_NO_L3) & 0xFF) as u8);
-                }
-                out.extend_from_slice(&dg.data);
-                let n = out.len().min(len); // datagram truncated to the buffer
+                // The custom payload is [PID][info…]. PIDINCL apps want it whole;
+                // otherwise strip the leading PID octet and deliver just the info.
+                let payload: &[u8] = if pidincl || dg.data.is_empty() {
+                    &dg.data
+                } else {
+                    &dg.data[1..]
+                };
+                let n = payload.len().min(len); // datagram truncated to the buffer
                 if n > 0 {
-                    std::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, n);
+                    std::ptr::copy_nonoverlapping(payload.as_ptr(), buf as *mut u8, n);
                 }
                 if !src.is_null() {
                     addr::write_call(src, srclen, dg.source.as_deref().unwrap_or(""));
@@ -907,23 +910,29 @@ mod e2e_tests {
                     "socket" => {
                         let h = next.fetch_add(1, Ordering::Relaxed);
                         reply(&writer, id, Some(h));
-                        // A dgram socket: deliver an inbound UI frame after a
-                        // delay so the recvfrom test proves it waits for RX.
-                        if f.value.get("mode").and_then(|m| m.as_str()) == Some("dgram") {
-                            let w = writer.clone();
-                            std::thread::spawn(move || {
-                                std::thread::sleep(PUSH_DELAY);
-                                let push = format!(
-                                    r#"{{"type":"recv","handle":{h},"remote":"G0ABC-1","local":"GB7RDG-2","pid":240,"data":"beacon-rx"}}"#
-                                );
-                                let _ = write_frame(&mut *w.lock().unwrap(), push.as_bytes());
-                            });
-                        }
                     }
                     "sendto" => {
                         // Record the emitted UI frame, then ack it.
                         sendtos_srv.lock().unwrap().push(f.clone());
                         reply(&writer, id, None);
+                        // Echo an inbound UI frame back on the same handle after a
+                        // delay, so the recvfrom tests prove they wait for RX and so
+                        // both PIDINCL states can be exercised. Custom mode: the PID
+                        // is data[0] (0xF0), the info field is "beacon-rx", and there
+                        // is no `pid` field.
+                        if let Some(h) = f.handle() {
+                            let w = writer.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(PUSH_DELAY);
+                                let mut push = format!(
+                                    r#"{{"type":"recv","handle":{h},"remote":"G0ABC-1","local":"GB7RDG-2","port":"0","data":""#
+                                );
+                                push.push('\u{F0}'); // PID octet
+                                push.push_str("beacon-rx");
+                                push.push_str("\"}");
+                                let _ = write_frame(&mut *w.lock().unwrap(), push.as_bytes());
+                            });
+                        }
                     }
                     "send" => {
                         // Record the emitted connected-mode data frame, then ack.
@@ -1079,7 +1088,8 @@ mod e2e_tests {
         unsafe { crate::close(child) };
         unsafe { crate::close(lfd) };
 
-        // ---- (d) dgram: socket -> bind, then a blocking recvfrom gets the UI --
+        // ---- (d) dgram: socket -> bind -> sendto, then a blocking recvfrom gets
+        // the echoed UI. Without AX25_PIDINCL the leading PID octet is stripped. --
         let dfd = unsafe { crate::socket(AF_AX25, SOCK_DGRAM, 0) };
         assert!(dfd >= 0, "dgram socket() failed");
         let dlocal = sax25("GB7RDG-2");
@@ -1096,7 +1106,7 @@ mod e2e_tests {
             errno()
         );
 
-        // sendto with the default PID 0xF0 (no AX25_PIDINCL set yet).
+        // sendto with the default PID 0xF0 prepended (no AX25_PIDINCL set yet).
         let beacon = b"de GB7RDG-2 beacon";
         let dest = sax25("BEACON");
         let n = unsafe {
@@ -1129,7 +1139,7 @@ mod e2e_tests {
         assert_eq!(&rbuf[..rn as usize], b"beacon-rx", "wrong UI payload");
         assert_eq!(addr::decode(&src.sax25_call.ax25_call), "G0ABC-1", "wrong source");
 
-        // ---- (e) AX25_PIDINCL: the app's first byte becomes the sent PID -----
+        // ---- (e) AX25_PIDINCL: the app's [PID][info…] buffer is sent as-is -----
         let on: c_int = 1;
         unsafe {
             crate::setsockopt(
@@ -1140,7 +1150,7 @@ mod e2e_tests {
                 std::mem::size_of::<c_int>() as socklen_t,
             )
         };
-        let ip_frame = [0xCCu8, b'i', b'p']; // PID 0xCC (IP), data "ip"
+        let ip_frame = [0xCCu8, b'i', b'p']; // PID 0xCC (IP), info "ip"
         let n2 = unsafe {
             crate::sendto(
                 dfd,
@@ -1153,15 +1163,50 @@ mod e2e_tests {
         };
         assert_eq!(n2, ip_frame.len() as isize, "PIDINCL sendto returned {n2}");
 
-        // Assert the two captured sendto frames carried the right fields.
+        // ---- (f) RX under AX25_PIDINCL: the echoed frame is delivered whole,
+        // with the leading PID octet kept (the second sendto triggered the echo).
+        let mut src2: SockaddrAx25 = unsafe { std::mem::zeroed() };
+        let mut slen2 = std::mem::size_of::<SockaddrAx25>() as socklen_t;
+        let mut rbuf2 = [0u8; 128];
+        let rn2 = unsafe {
+            crate::recvfrom(
+                dfd,
+                rbuf2.as_mut_ptr() as *mut c_void,
+                rbuf2.len(),
+                0,
+                &mut src2 as *mut SockaddrAx25 as *mut sockaddr,
+                &mut slen2,
+            )
+        };
+        assert!(rn2 > 0, "PIDINCL recvfrom failed (errno {})", errno());
+        // PID 0xF0 is kept as byte 0, then the info "beacon-rx".
+        let mut expected = vec![0xF0u8];
+        expected.extend_from_slice(b"beacon-rx");
+        assert_eq!(&rbuf2[..rn2 as usize], &expected[..], "PIDINCL must keep the PID octet");
+        assert_eq!(addr::decode(&src2.sax25_call.ax25_call), "G0ABC-1", "wrong source");
+
+        // Assert the two captured sendto frames carried the right custom `data`.
+        // Custom mode: PID is data[0], no `pid` field.
         let captured = sendtos.lock().unwrap();
         assert_eq!(captured.len(), 2, "expected two sendto frames");
         assert_eq!(captured[0].remote(), Some("BEACON"));
         assert_eq!(captured[0].local(), Some("GB7RDG-2"));
-        assert_eq!(captured[0].pid(), Some(0xF0), "default PID must be 0xF0");
-        assert_eq!(captured[0].data_str(), Some("de GB7RDG-2 beacon"));
-        assert_eq!(captured[1].pid(), Some(0xCC), "PIDINCL must strip byte 0 as PID");
-        assert_eq!(captured[1].data_str(), Some("ip"), "PIDINCL must send the rest as data");
+        // (a) default path: 0xF0 prepended, then the app bytes.
+        assert_eq!(
+            captured[0].data_str().map(rhp::codec::from_wire_string),
+            Some({
+                let mut v = vec![0xF0u8];
+                v.extend_from_slice(b"de GB7RDG-2 beacon");
+                v
+            }),
+            "default PID 0xF0 must be prepended as data[0]"
+        );
+        // (b) PIDINCL path: the app's [0xCC]['i']['p'] buffer sent unchanged.
+        assert_eq!(
+            captured[1].data_str().map(rhp::codec::from_wire_string),
+            Some(vec![0xCCu8, b'i', b'p']),
+            "PIDINCL must send the [PID][info…] buffer as-is"
+        );
         drop(captured);
 
         unsafe { crate::close(dfd) };

@@ -113,11 +113,16 @@ mock RHP server:
   per-handle buffer plus a flusher thread drains into the socketpair as the app
   reads, without stalling the shared RHP reader thread.
 * **Connectionless UI** (`SOCK_DGRAM`): `socket → bind → sendto/recvfrom` maps to
-  RHP `socket{mode:dgram} → bind → sendto → recv`. `sendto` uses PID `0xF0` by
-  default (the beacon/APRS default), or strips the app's first byte as the PID
-  when `AX25_PIDINCL` is set (e.g. `0xCC` for IP-over-AX.25); inbound UI is
-  delivered whole through `recvfrom` with the source callsign filled, and all UI
-  heard on the bound port is seen (promiscuous, matching pdn's dgram RX).
+  RHP `socket{mode:custom} → bind → sendto → recv`. In `custom` mode the AX.25 PID
+  travels as the first octet of the `data` field (`[PID][info…]`), not a separate
+  field. This is G8PZT's clarification of the carriage; PWP-0222 §1.2 only says
+  the PID is a "user specified protocol", so it is not spelled out in the spec.
+  `sendto` uses PID `0xF0` by default (the beacon/APRS default), prepending it to
+  the app buffer; with `AX25_PIDINCL` set the app already supplies `[PID][info…]`
+  (e.g. `0xCC` for IP-over-AX.25) and it is sent as-is. Inbound UI is delivered
+  whole through `recvfrom` with the source callsign filled, the PID stripped
+  (or kept when `AX25_PIDINCL` is set), and all UI heard on the bound port is seen
+  (promiscuous, matching pdn's connectionless RX).
 
 Worked examples of every one of these paths - using only the standard `AF_AX25`
 socket API - live in [`samples/`](samples/) (connected client/listener, UI
