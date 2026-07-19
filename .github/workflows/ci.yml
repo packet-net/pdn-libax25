@@ -18,6 +18,23 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Set up Rust
+        # Bootstrap rustup per-user if the shared runner has no Rust on PATH
+        # (idempotent; reused on the non-ephemeral runner after first run).
+        run: |
+          set -eu
+          if ! command -v cargo >/dev/null 2>&1; then
+            if [ -x "$HOME/.cargo/bin/cargo" ]; then
+              export PATH="$HOME/.cargo/bin:$PATH"
+            else
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable
+              export PATH="$HOME/.cargo/bin:$PATH"
+            fi
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup component add clippy || echo "::warning::clippy component add failed"
+
       - name: Build (release)
         run: cargo build --release --locked
 

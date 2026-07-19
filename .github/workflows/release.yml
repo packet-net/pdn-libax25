@@ -37,10 +37,24 @@ jobs:
             echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install cross toolchains
-        # amd64 is native. arm64 is a required target; armhf is best-effort (see below).
+      - name: Set up Rust + cross toolchains
+        # The self-hosted runners are shared with the .NET projects and may not carry a
+        # Rust toolchain on PATH — bootstrap rustup per-user (idempotent; reused on the
+        # non-ephemeral runner after first run) so this workflow is self-sufficient.
+        # amd64 is native; arm64 is a required target; armhf is best-effort (see below).
         run: |
           set -eu
+          if ! command -v rustup >/dev/null 2>&1; then
+            if [ -x "$HOME/.cargo/bin/rustup" ]; then
+              export PATH="$HOME/.cargo/bin:$PATH"
+            else
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable
+              export PATH="$HOME/.cargo/bin:$PATH"
+            fi
+          fi
+          # Persist cargo/rustup on PATH for the later build step.
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y gcc-aarch64-linux-gnu
