@@ -32,9 +32,16 @@ pub struct FdState {
     pub dgram: bool,
     /// AX25_PIDINCL: the app prepends/consumes the PID byte itself (see lib.rs).
     pub pidincl: bool,
-    /// Captured AX.25 socket options (applied to a future OPEN where sensible).
+    /// Captured AX.25 socket options. WINDOW/PACLEN are forwarded to the node
+    /// on OPEN; T1/T2/T3/N2/EXTSEQ are stored for getsockopt round-trips but
+    /// are node-side-only (RHPv2 has no wire fields for them yet).
     pub paclen: Option<u32>,
     pub window: Option<u32>,
+    pub t1: Option<u32>,
+    pub t2: Option<u32>,
+    pub t3: Option<u32>,
+    pub n2: Option<u32>,
+    pub extseq: Option<u32>,
 }
 
 pub fn fds() -> &'static Mutex<HashMap<c_int, FdState>> {
@@ -733,6 +740,11 @@ pub fn create_ax25_fd(dgram: bool) -> Option<c_int> {
             pidincl: false,
             paclen: None,
             window: None,
+            t1: None,
+            t2: None,
+            t3: None,
+            n2: None,
+            extseq: None,
         },
     );
     Some(app_fd)
