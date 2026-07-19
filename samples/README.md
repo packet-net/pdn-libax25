@@ -41,7 +41,7 @@ UI/datagram - see [below](#when-to-use-which-connected-mode-vs-uidatagram).)*
 The sample `.c` files are **`0BSD`** (SPDX `0BSD`) - copy, paste and adapt them
 freely with no strings attached. Note this is *only* the samples: the interposer
 shim itself (`libax25_interpose.so`) and the rest of this repo are
-**LGPL-3.0-or-later**.
+**AGPL-3.0-or-later**.
 
 ## Build
 

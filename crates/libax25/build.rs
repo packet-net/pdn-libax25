@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // Set the SONAME of the produced cdylib to `libax25.so.1`, matching upstream
 // ve7fet libax25 (real file libax25.so.1.0.1, SONAME libax25.so.1, pkg 1.2.2)

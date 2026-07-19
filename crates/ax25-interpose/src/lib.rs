@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // ax25-interpose — an LD_PRELOAD libc interposer that lets UNMODIFIED Linux ham
 // apps (ax25-apps, ax25-tools, FBB) use the pdn AX.25 stack instead of the
@@ -11,7 +11,7 @@
 //
 // Model: an AX.25 socket is backed by a real `socketpair` so the app's
 // select/poll/read keep working with real libc; a background reader thread in
-// the `rhp` client writes inbound data into our end of the pair, and our
+// the `rhpv2` client writes inbound data into our end of the pair, and our
 // write/send wrappers forward outbound data to RHP `send`. Writes we cannot
 // interpose (glibc stdio — dprintf/fprintf — flushes via the non-interposable
 // __write alias / raw syscall) still land in the socketpair, so an OutboundPump
@@ -140,7 +140,7 @@ pub unsafe extern "C" fn listen(fd: c_int, backlog: c_int) -> c_int {
         set_errno(libc::ECONNREFUSED);
         return -1;
     };
-    let result = (|| -> Result<u64, rhp::RhpError> {
+    let result = (|| -> Result<u64, rhpv2::RhpError> {
         let h = client.socket()?;
         client.bind(h, &local, None)?;
         client.listen(h)?;
@@ -850,8 +850,8 @@ mod e2e_tests {
         SOL_AX25,
     };
     use libc::{c_int, c_void, sockaddr, socklen_t};
-    use rhp::framing::{read_frame, write_frame};
-    use rhp::messages::Frame;
+    use rhpv2::framing::{read_frame, write_frame};
+    use rhpv2::messages::Frame;
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::io::AsRawFd;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1240,7 +1240,7 @@ mod e2e_tests {
         assert_eq!(captured[0].local(), Some("GB7RDG-2"));
         // (a) default path: 0xF0 prepended, then the app bytes.
         assert_eq!(
-            captured[0].data_str().map(rhp::codec::from_wire_string),
+            captured[0].data_str().map(rhpv2::codec::from_wire_string),
             Some({
                 let mut v = vec![0xF0u8];
                 v.extend_from_slice(b"de GB7RDG-2 beacon");
@@ -1250,7 +1250,7 @@ mod e2e_tests {
         );
         // (b) PIDINCL path: the app's [0xCC]['i']['p'] buffer sent unchanged.
         assert_eq!(
-            captured[1].data_str().map(rhp::codec::from_wire_string),
+            captured[1].data_str().map(rhpv2::codec::from_wire_string),
             Some(vec![0xCCu8, b'i', b'p']),
             "PIDINCL must send the [PID][info…] buffer as-is"
         );

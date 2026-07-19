@@ -1,11 +1,11 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // Global interposer state: the fd -> AX.25 socket map, the shared RHP client,
 // and the event sink that pumps RHP `recv`/`accept`/`status`/`close` pushes back
 // into the app-visible socketpair fds.
 
 use libc::{c_int, c_void};
-use rhp::{RhpClient, RhpEventSink, STATUS_CONNECTED};
+use rhpv2::{RhpClient, RhpEventSink, STATUS_CONNECTED};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 

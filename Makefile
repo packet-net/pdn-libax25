@@ -1,7 +1,7 @@
 # pdn-libax25 convenience Makefile.
 #
 # `cargo build` is the source of truth; this just adds the conventional
-# versioned symlinks and an install target. Licence: LGPL-3.0-or-later.
+# versioned symlinks and an install target. Licence: AGPL-3.0-or-later.
 
 PREFIX ?= /usr/local
 LIBDIR ?= $(PREFIX)/lib

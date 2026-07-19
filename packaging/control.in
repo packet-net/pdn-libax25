@@ -12,7 +12,7 @@ Description: AF_AX25 seam for the pdn AX.25 stack (opt-in LD_PRELOAD shim)
  use the pdn AX.25 stack (packet.net) instead of the Linux kernel AF_AX25 stack,
  which was removed from mainline in Linux 7.1.
  .
- Ships two native LGPL-3.0 artifacts into the PRIVATE path /usr/lib/pdn-libax25/
+ Ships two native AGPL-3.0 artifacts into the PRIVATE path /usr/lib/pdn-libax25/
  (never the default library path, so system AX.25 is not hijacked):
  libax25.so.1, a drop-in for ve7fet libax25's helper/axports ABI; and
  ax25-interpose.so, an LD_PRELOAD libc interposer that routes AF_AX25 sockets to

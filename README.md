@@ -11,15 +11,16 @@ packet.net's [network-integration ADR](https://github.com/packet-net/packet.net/
 covers when to use which.
 
 It ships **two** native `.so` artifacts (both Rust `cdylib`s), licence
-**LGPL-3.0-or-later**:
+**AGPL-3.0-or-later**:
 
 | Artifact | Role |
 |----------|------|
 | **`libax25.so.1`** | Drop-in replacement for ve7fet **libax25**'s *helper* library - address parsing (`ax25_aton*`/`ax25_ntoa`/`ax25_cmp`/`ax25_validate`) and `axports` config parsing. libax25 has **no** connection code; apps link `-lax25` only for these helpers. SONAME is `libax25.so.1` (upstream real file `libax25.so.1.0.1`, pkg 1.2.2). |
 | **`ax25-interpose.so`** | An `LD_PRELOAD` libc interposer. It wraps the socket/IO calls, detects `AF_AX25` (family 3) sockets - `SOCK_SEQPACKET` (connected sessions) and `SOCK_DGRAM` (connectionless UI) - routes them to a pdn **RHPv2** connection, and passes every other call straight through to real libc via `dlsym(RTLD_NEXT, …)`. Build output is `libax25_interpose.so`. |
 
-Both share an internal **`rhp`** crate - an RHPv2 client over loopback TCP
-`127.0.0.1:9000` (override with `PDN_RHP_ADDR`).
+Both share the **[`rhpv2`](crates/rhpv2)** crate - an RHPv2 client over loopback
+TCP `127.0.0.1:9000` (override with `PDN_RHP_ADDR`). It is a standalone,
+publishable crate in its own right.
 
 ## Why two pieces
 
@@ -33,7 +34,7 @@ talking to the kernel `AF_AX25` socket API. With the kernel stack gone:
 2. `ax25-interpose.so` provides the *connections*, transparently, by turning
    `AF_AX25` sockets into pdn RHPv2 sessions.
 
-## The RHPv2 client (`rhp` crate)
+## The RHPv2 client (`rhpv2` crate)
 
 * Transport: persistent, multiplexed TCP to `127.0.0.1:9000` (env
   `PDN_RHP_ADDR`). Optional `auth` only when `PDN_RHP_USER`/`PDN_RHP_PASS` are
@@ -134,8 +135,9 @@ timer socket options captured as no-ops; connect-via-digipeater paths; the
 
 ## Licence
 
-LGPL-3.0-or-later. See [`COPYING.LESSER`](COPYING.LESSER) (LGPL-3.0) and
-[`COPYING`](COPYING) (GPL-3.0). Address/config logic was reimplemented
+AGPL-3.0-or-later — all three crates (`rhpv2`, `libax25`, `ax25-interpose`). See
+[`COPYING`](COPYING) (AGPL-3.0). Address/config logic was reimplemented
 clean-room from ve7fet libax25 (GPL) read as a semantic reference only; no GPL
 code is copied in. New dependencies (`serde`, `serde_json`, `libc`) are
-MIT/Apache-2.0.
+MIT/Apache-2.0. The example programs under [`samples/`](samples) are 0BSD so you
+can copy them freely.

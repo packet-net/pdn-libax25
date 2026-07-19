@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-rhp = { path = "../rhp" }
+rhpv2 = { path = "../rhpv2" }
 libc.workspace = true
 
 [build-dependencies]
