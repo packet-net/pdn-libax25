@@ -67,15 +67,17 @@ pub struct SocketReq<'a> {
     pub typ: &'static str, // "socket"
     pub id: u64,
     pub pfam: &'a str,
-    pub mode: &'a str, // "stream" (connected) or "dgram" (connectionless UI)
+    pub mode: &'a str, // "stream" (connected) or "custom" (connectionless UI)
 }
 
-/// Connectionless UI send (RHPv2 `sendto`, family `ax25`, mode `dgram`).
+/// Connectionless UI send (RHPv2 `sendto`, family `ax25`, mode `custom`).
 ///
 /// One AX.25 UI frame: `remote` is the destination callsign, `local` the source
-/// (bound) callsign, `pid` the AX.25 protocol-id byte (0xF0 = no-Layer-3, the
-/// beacon/APRS default; 0xCC = IP), and `data` the Latin-1 payload. `pid` is a
-/// nullable int on the wire — we always send a concrete value.
+/// (bound) callsign, and `data` the Latin-1 wire string whose FIRST octet is the
+/// AX.25 PID and whose remainder is the info field. Under RHPv2 `custom` mode the
+/// PID is carried in `data[0]`, not a separate field (G8PZT's clarification;
+/// PWP-0222 §1.2 says only "user specified protocol"). 0xF0 = no-Layer-3 (the
+/// beacon/APRS default); 0xCC = IP.
 #[derive(Serialize)]
 pub struct SendToReq<'a> {
     #[serde(rename = "type")]
@@ -84,8 +86,7 @@ pub struct SendToReq<'a> {
     pub handle: u64,
     pub remote: &'a str, // destination callsign
     pub local: &'a str,  // source (bound) callsign
-    pub pid: Option<i64>,
-    pub data: &'a str, // Latin-1 wire string (see codec.rs)
+    pub data: &'a str,   // Latin-1 wire string: [PID][info…] (see codec.rs)
 }
 
 #[derive(Serialize)]
@@ -193,16 +194,12 @@ impl Frame {
         self.value.get("data").and_then(|v| v.as_str())
     }
 
-    /// The AX.25 `pid` byte on a dgram `recv`/`sendto` frame, if present.
-    pub fn pid(&self) -> Option<i64> {
-        self.value.get("pid").and_then(|v| v.as_i64())
-    }
-
     /// True if a `recv` push is a connectionless UI datagram rather than a
-    /// connected-stream delivery. Dgram `recv` pushes carry the source (`remote`)
-    /// and/or the AX.25 `pid`; a stream `recv` carries neither.
+    /// connected-stream delivery. A `custom`-mode UI `recv` carries the source
+    /// (`remote`) and the receiving `port`; a stream `recv` carries neither. The
+    /// PID rides in `data[0]`, not a separate field.
     pub fn is_dgram_recv(&self) -> bool {
-        self.value.get("remote").is_some() || self.value.get("pid").is_some()
+        self.value.get("remote").is_some() || self.value.get("port").is_some()
     }
 
     /// The `remote` address string (on `accept`).
@@ -261,38 +258,39 @@ mod tests {
     }
 
     #[test]
-    fn sendto_serialises_type_first_with_pid_and_data() {
+    fn sendto_serialises_type_first_with_pid_in_data_and_no_pid_field() {
+        // Custom mode: PID rides in data[0] (0xF0 == '\u{F0}'), no `pid` field.
         let req = SendToReq {
             typ: "sendto",
             id: 3,
             handle: 9,
             remote: "BEACON",
             local: "M0LTE-2",
-            pid: Some(0xF0),
-            data: "hello",
+            data: "\u{F0}hello",
         };
         let s = serde_json::to_string(&req).unwrap();
+        // `type` must be the first key on the wire.
         assert!(s.starts_with("{\"type\":\"sendto\""), "got: {s}");
-        assert!(s.contains("\"remote\":\"BEACON\""), "got: {s}");
-        assert!(s.contains("\"local\":\"M0LTE-2\""), "got: {s}");
-        assert!(s.contains("\"pid\":240"), "got: {s}");
-        assert!(s.contains("\"data\":\"hello\""), "got: {s}");
+        assert!(!s.contains("\"pid\""), "custom mode carries no pid field: {s}");
+        // Parse back to avoid asserting serde's exact non-ASCII escaping.
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["remote"], "BEACON");
+        assert_eq!(v["local"], "M0LTE-2");
+        assert_eq!(v["data"], "\u{F0}hello");
     }
 
     #[test]
-    fn dgram_recv_push_is_detected_by_remote_or_pid() {
-        // A dgram recv carries the source (remote) and the pid.
+    fn dgram_recv_push_is_detected_by_remote_or_port() {
+        // A custom-mode UI recv carries the source (remote) and receiving port.
         let f = Frame::parse(
-            br#"{"type":"recv","handle":7,"remote":"G0ABC-1","local":"M0LTE","pid":240,"data":"hi"}"#,
+            br#"{"type":"recv","handle":7,"remote":"G0ABC-1","local":"M0LTE","port":"1","data":"hi"}"#,
         )
         .unwrap();
         assert!(f.is_dgram_recv());
         assert_eq!(f.remote(), Some("G0ABC-1"));
-        assert_eq!(f.pid(), Some(240));
         // A stream recv carries neither -> not a dgram.
         let f = Frame::parse(br#"{"type":"recv","handle":7,"data":"hi","seqno":1}"#).unwrap();
         assert!(!f.is_dgram_recv());
-        assert_eq!(f.pid(), None);
     }
 
     #[test]

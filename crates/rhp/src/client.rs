@@ -53,16 +53,16 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub trait RhpEventSink: Send + Sync {
     /// Inbound data on a connected (stream) handle.
     fn on_recv(&self, _handle: u64, _data: &[u8]) {}
-    /// An inbound connectionless UI datagram on a `dgram` handle. `source` is the
-    /// sender's callsign, `dest` the destination it was addressed to, `pid` the
-    /// AX.25 protocol-id byte. All UI heard on the bound port is delivered
-    /// (promiscuous), matching pdn's dgram RX.
+    /// An inbound connectionless UI datagram on a `custom`-mode handle. `source`
+    /// is the sender's callsign, `dest` the destination it was addressed to, and
+    /// `data` the raw custom payload whose first octet is the AX.25 PID (`[PID]
+    /// [info…]`). All UI heard on the bound port is delivered (promiscuous),
+    /// matching pdn's connectionless RX.
     fn on_dgram(
         &self,
         _handle: u64,
         _source: Option<String>,
         _dest: Option<String>,
-        _pid: Option<i64>,
         _data: &[u8],
     ) {
     }
@@ -499,21 +499,21 @@ impl RhpClient {
         Self::check_ok(&reply)
     }
 
-    /// Send one connectionless UI datagram (`sendto`). `remote` is the
-    /// destination callsign, `local` the source (bound) callsign, `pid` the
-    /// AX.25 protocol-id byte (0xF0 for no-Layer-3). pdn rejects an empty
-    /// payload (errCode 1), so callers should filter that before calling.
+    /// Send one connectionless UI datagram (`sendto`, RHPv2 `custom` mode).
+    /// `remote` is the destination callsign, `local` the source (bound) callsign,
+    /// and `data` the custom payload whose first octet is the AX.25 PID (`[PID]
+    /// [info…]`; 0xF0 for no-Layer-3). pdn rejects an empty `data` (errCode 1), so
+    /// callers should filter that before calling.
     pub fn sendto(
         &self,
         handle: u64,
         remote: &str,
         local: &str,
-        pid: Option<i64>,
         data: &[u8],
     ) -> Result<(), RhpError> {
         let id = self.next_id();
         let wire = codec::to_wire_string(data);
-        let req = SendToReq { typ: "sendto", id, handle, remote, local, pid, data: &wire };
+        let req = SendToReq { typ: "sendto", id, handle, remote, local, data: &wire };
         let bytes = serde_json::to_vec(&req).map_err(json_io)?;
         let reply = self.request(id, &bytes)?;
         Self::check_ok(&reply)
@@ -537,9 +537,11 @@ impl RhpClient {
         self.socket_mode("stream")
     }
 
-    /// Allocate a connectionless-UI socket handle (`socket`, mode `dgram`).
+    /// Allocate a connectionless-UI socket handle (`socket`, mode `custom`). The
+    /// PID travels in `data[0]` of each `sendto`/`recv` (RHPv2 `custom`), not a
+    /// separate field.
     pub fn socket_dgram(&self) -> Result<u64, RhpError> {
-        self.socket_mode("dgram")
+        self.socket_mode("custom")
     }
 
     fn socket_mode(&self, mode: &str) -> Result<u64, RhpError> {
@@ -665,10 +667,11 @@ fn dispatch_push(
             if let Some(h) = frame.handle() {
                 let data = frame.data_str().map(codec::from_wire_string).unwrap_or_default();
                 if frame.is_dgram_recv() {
-                    // Connectionless UI: carries source (remote), dest (local), pid.
+                    // Connectionless UI (custom mode): carries source (remote) and
+                    // dest (local); the PID is data[0] of `data`.
                     let source = frame.remote().map(|s| s.to_string());
                     let dest = frame.local().map(|s| s.to_string());
-                    sink.on_dgram(h, source, dest, frame.pid(), &data);
+                    sink.on_dgram(h, source, dest, &data);
                 } else {
                     sink.on_recv(h, &data);
                 }
@@ -972,9 +975,9 @@ mod tests {
     }
 
     #[test]
-    fn socket_dgram_requests_dgram_mode_and_sendto_carries_pid_data() {
+    fn socket_dgram_requests_custom_mode_and_sendto_carries_pid_in_data() {
         // Capture the socket + sendto requests the client emits so we can assert
-        // the dgram mode and the sendto remote/local/pid/data.
+        // the custom mode and the sendto remote/local/data (PID in data[0]).
         let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_w = seen.clone();
         let addr = spawn_mock(move |mut sock| {
@@ -996,22 +999,27 @@ mod tests {
         let client = RhpClient::connect_to(addr, Arc::new(NullSink)).unwrap();
         let h = client.socket_dgram().unwrap();
         assert_eq!(h, 21);
-        client.sendto(h, "BEACON", "M0LTE-2", Some(0xF0), b"de M0LTE").unwrap();
+        // The caller passes the whole custom payload: PID 0xF0 as data[0].
+        let mut wire = vec![0xF0u8];
+        wire.extend_from_slice(b"de M0LTE");
+        client.sendto(h, "BEACON", "M0LTE-2", &wire).unwrap();
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen[0]["type"], "socket");
-        assert_eq!(seen[0]["mode"], "dgram");
+        assert_eq!(seen[0]["mode"], "custom");
         assert_eq!(seen[1]["type"], "sendto");
         assert_eq!(seen[1]["remote"], "BEACON");
         assert_eq!(seen[1]["local"], "M0LTE-2");
-        assert_eq!(seen[1]["pid"], 240);
-        assert_eq!(seen[1]["data"], "de M0LTE");
+        assert!(seen[1].get("pid").is_none(), "custom mode carries no pid field");
+        // data[0] is the PID (0xF0 == '\u{F0}'), remainder the info field.
+        assert_eq!(seen[1]["data"], "\u{F0}de M0LTE");
     }
 
-    /// A sink that records the last dgram delivered (source/dest/pid/data).
+    /// A sink that records the last dgram delivered (source/dest/data). In custom
+    /// mode `data` is the raw `[PID][info…]` payload.
     #[derive(Default)]
     struct DgramSink {
-        last: Mutex<Option<(Option<String>, Option<String>, Option<i64>, Vec<u8>)>>,
+        last: Mutex<Option<(Option<String>, Option<String>, Vec<u8>)>>,
     }
     impl RhpEventSink for DgramSink {
         fn on_dgram(
@@ -1019,15 +1027,14 @@ mod tests {
             _handle: u64,
             source: Option<String>,
             dest: Option<String>,
-            pid: Option<i64>,
             data: &[u8],
         ) {
-            *self.last.lock().unwrap() = Some((source, dest, pid, data.to_vec()));
+            *self.last.lock().unwrap() = Some((source, dest, data.to_vec()));
         }
     }
 
     #[test]
-    fn dgram_recv_push_routes_to_on_dgram_with_source_and_pid() {
+    fn dgram_recv_push_routes_to_on_dgram_with_source_and_pid_in_data() {
         let addr = spawn_mock(|mut sock| {
             let req = read_frame(&mut sock).unwrap().unwrap();
             let id = Frame::parse(&req).unwrap().id().unwrap();
@@ -1035,10 +1042,11 @@ mod tests {
                 r#"{{"type":"socketReply","id":{id},"handle":8,"errCode":0,"errText":"Ok"}}"#
             );
             write_frame(&mut sock, reply.as_bytes()).unwrap();
-            // Inbound UI frame: source G0ABC-1 -> dest APRS, pid 0xF0, data "!pos".
+            // Inbound UI frame: source G0ABC-1 -> dest APRS, port 0, custom data
+            // "\u{F0}!pos" (PID 0xF0 as data[0], then the info "!pos").
             write_frame(
                 &mut sock,
-                br#"{"type":"recv","handle":8,"remote":"G0ABC-1","local":"APRS","pid":240,"data":"!pos"}"#,
+                "{\"type\":\"recv\",\"handle\":8,\"remote\":\"G0ABC-1\",\"local\":\"APRS\",\"port\":\"0\",\"data\":\"\u{F0}!pos\"}".as_bytes(),
             )
             .unwrap();
             sock.flush().unwrap();
@@ -1053,8 +1061,8 @@ mod tests {
         let got = sink.last.lock().unwrap().clone().expect("dgram delivered");
         assert_eq!(got.0.as_deref(), Some("G0ABC-1"));
         assert_eq!(got.1.as_deref(), Some("APRS"));
-        assert_eq!(got.2, Some(240));
-        assert_eq!(got.3, b"!pos".to_vec());
+        // data[0] is the PID (0xF0), remainder the info field.
+        assert_eq!(got.2, vec![0xF0, b'!', b'p', b'o', b's']);
     }
 
     #[test]

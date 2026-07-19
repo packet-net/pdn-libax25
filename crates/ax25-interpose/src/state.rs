@@ -402,9 +402,11 @@ fn nb_write(inner_fd: c_int, data: &[u8]) -> WriteOutcome {
 /// One received UI datagram awaiting `recvfrom`. The destination callsign the
 /// frame carried is not stored: the standard `recvfrom` API returns only the
 /// source address, and a bound socket's destination is its own bound callsign.
+///
+/// `data` is the raw RHPv2 `custom` payload: its first octet is the AX.25 PID and
+/// the remainder is the info field (`[PID][info…]`).
 pub struct Datagram {
     pub source: Option<String>,
-    pub pid: Option<i64>,
     pub data: Vec<u8>,
 }
 
@@ -621,10 +623,11 @@ impl RhpEventSink for InterposeSink {
         handle: u64,
         source: Option<String>,
         _dest: Option<String>,
-        pid: Option<i64>,
         data: &[u8],
     ) {
-        dgram_pump().push(handle, Datagram { source, pid, data: data.to_vec() });
+        // `data` is the raw custom payload [PID][info…]; the recv path strips or
+        // keeps the PID octet per AX25_PIDINCL.
+        dgram_pump().push(handle, Datagram { source, data: data.to_vec() });
     }
 
     fn on_status(&self, handle: u64, flags: i64) {
