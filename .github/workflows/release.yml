@@ -27,11 +27,6 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write
-    # Job level, not step level: a secret put in a step's own env: is not visible to that
-    # step's if:, so the "is the token there?" test in the apt-notify steps has to read it
-    # from here.
-    env:
-      APT_DISPATCH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
     steps:
       - uses: actions/checkout@v6
 
@@ -106,27 +101,20 @@ jobs:
         # Last, and only after gh release create has succeeded: packet-net/apt indexes whatever
         # is on releases/latest when it runs, so dispatching before the assets exist would just
         # make it re-index the previous release.
-        if: env.APT_DISPATCH_TOKEN != ''
+        #
+        # A HARD requirement, not fire-and-forget (Tom, 2026-09-18): if this repo cannot tell
+        # packet-net/apt about the release, the build fails rather than shipping quietly with
+        # apt left stale until its next scheduled rebuild.
         env:
           GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
           TAG: v${{ steps.v.outputs.version }}
         run: |
-          # Fire and forget: packet-net/apt rebuilds its whole index from every source repo's
-          # latest release, so the payload is only there for the run log. A failure here must
-          # not fail a release that has already shipped - the daily cron picks it up.
-          #
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::APT_DISPATCH_TOKEN is not visible to this repo - cannot notify packet-net/apt"
+            exit 1
+          fi
           # gh api --input - with a JSON body, not -f client_payload[...]=...: gh's -f does not
           # do curl-style bracket nesting, so the nested object has to arrive as JSON.
           payload=$(printf '{"event_type":"release-published","client_payload":{"repo":"%s","tag":"%s"}}' \
             "$GITHUB_REPOSITORY" "$TAG")
-          if printf '%s' "$payload" | gh api -X POST repos/packet-net/apt/dispatches --input -; then
-            echo "apt repo rebuild triggered."
-          else
-            echo "::warning::could not trigger the packet-net/apt rebuild; its daily cron will pick this release up."
-          fi
-
-      - name: Warn if APT_DISPATCH_TOKEN missing
-        # Not a failure. The apt repo's cron is the fallback, so a release without the secret
-        # still reaches apt, just later.
-        if: env.APT_DISPATCH_TOKEN == ''
-        run: echo "::warning::APT_DISPATCH_TOKEN is not visible to this repo - the apt repo was not poked. It will pick this release up on its next scheduled rebuild."
+          printf '%s' "$payload" | gh api -X POST repos/packet-net/apt/dispatches --input -
