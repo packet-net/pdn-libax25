@@ -27,6 +27,11 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write
+    # Job level, not step level: a secret put in a step's own env: is not visible to that
+    # step's if:, so the "is the token there?" test in the apt-notify steps has to read it
+    # from here.
+    env:
+      APT_DISPATCH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
     steps:
       - uses: actions/checkout@v6
 
@@ -97,22 +102,31 @@ jobs:
             --title "pdn-libax25 v${VERSION}" \
             --notes "AF_AX25 seam for the pdn AX.25 stack — an **opt-in** LD_PRELOAD shim (AGPL-3.0). Install the \`.deb\` for your arch: \`sudo apt install ./pdn-libax25_${VERSION}_<arch>.deb\`. It lands in the private path \`/usr/lib/pdn-libax25/\` (never hijacks system AX.25) and ships a \`pdn-ax25\` wrapper — run any AF_AX25 app through it, e.g. \`PDN_RHP_ADDR=127.0.0.1:9000 pdn-ax25 axcall radio GB7RDG\`. \`SHA256SUMS\` covers the .debs. Requires a running pdn node reachable over RHPv2 (\`Recommends: packetnet\`, not a hard dependency)."
 
-      - name: Notify apt repo
+      - name: Tell the apt repo to rebuild
+        # Last, and only after gh release create has succeeded: packet-net/apt indexes whatever
+        # is on releases/latest when it runs, so dispatching before the assets exist would just
+        # make it re-index the previous release.
+        if: env.APT_DISPATCH_TOKEN != ''
         env:
-          APT_DISPATCH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
           TAG: v${{ steps.v.outputs.version }}
-        # POSTs a release-published repository_dispatch at packet-net/apt, so the apt index
-        # picks this release up in about a minute instead of waiting for its daily self-heal
-        # cron. Needs a fine-grained PAT (Contents: Read and write on packet-net/apt only) as
-        # the APT_DISPATCH_TOKEN secret; warns rather than fails when it's missing, so a
-        # release never fails over it. See packet-net/apt's README, "How it works".
         run: |
-          if [ -z "$APT_DISPATCH_TOKEN" ]; then
-            echo "::warning::APT_DISPATCH_TOKEN is not set, so packet-net/apt will pick this release up on its next scheduled rebuild instead of immediately"
-            exit 0
+          # Fire and forget: packet-net/apt rebuilds its whole index from every source repo's
+          # latest release, so the payload is only there for the run log. A failure here must
+          # not fail a release that has already shipped - the daily cron picks it up.
+          #
+          # gh api --input - with a JSON body, not -f client_payload[...]=...: gh's -f does not
+          # do curl-style bracket nesting, so the nested object has to arrive as JSON.
+          payload=$(printf '{"event_type":"release-published","client_payload":{"repo":"%s","tag":"%s"}}' \
+            "$GITHUB_REPOSITORY" "$TAG")
+          if printf '%s' "$payload" | gh api -X POST repos/packet-net/apt/dispatches --input -; then
+            echo "apt repo rebuild triggered."
+          else
+            echo "::warning::could not trigger the packet-net/apt rebuild; its daily cron will pick this release up."
           fi
-          curl -fsS -X POST \
-            -H "Authorization: Bearer $APT_DISPATCH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/packet-net/apt/dispatches \
-            -d "{\"event_type\":\"release-published\",\"client_payload\":{\"repo\":\"${{ github.repository }}\",\"tag\":\"$TAG\"}}"
+
+      - name: Warn if APT_DISPATCH_TOKEN missing
+        # Not a failure. The apt repo's cron is the fallback, so a release without the secret
+        # still reaches apt, just later.
+        if: env.APT_DISPATCH_TOKEN == ''
+        run: echo "::warning::APT_DISPATCH_TOKEN is not visible to this repo - the apt repo was not poked. It will pick this release up on its next scheduled rebuild."
