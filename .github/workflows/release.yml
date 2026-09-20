@@ -1,7 +1,9 @@
 name: release
 
 # On a `v*` tag: build the two pdn-libax25 cdylibs for each architecture, package
-# per-arch .debs, and attach them (+ SHA256SUMS) to a GitHub Release. No apt repo.
+# per-arch .debs, and attach them (+ SHA256SUMS) to a GitHub Release. Also
+# notifies packet-net/apt so the release reaches the apt repo (see the "Notify
+# apt repo" step below).
 #
 # Self-hosted x64 only (org convention — no GitHub-hosted runners). arm64 (and, best
 # effort, armhf) cross-compile from x64 via the .cargo/config.toml linkers, so no
@@ -94,3 +96,25 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "pdn-libax25 v${VERSION}" \
             --notes "AF_AX25 seam for the pdn AX.25 stack — an **opt-in** LD_PRELOAD shim (AGPL-3.0). Install the \`.deb\` for your arch: \`sudo apt install ./pdn-libax25_${VERSION}_<arch>.deb\`. It lands in the private path \`/usr/lib/pdn-libax25/\` (never hijacks system AX.25) and ships a \`pdn-ax25\` wrapper — run any AF_AX25 app through it, e.g. \`PDN_RHP_ADDR=127.0.0.1:9000 pdn-ax25 axcall radio GB7RDG\`. \`SHA256SUMS\` covers the .debs. Requires a running pdn node reachable over RHPv2 (\`Recommends: packetnet\`, not a hard dependency)."
+
+      - name: Tell the apt repo to rebuild
+        # Last, and only after gh release create has succeeded: packet-net/apt indexes whatever
+        # is on releases/latest when it runs, so dispatching before the assets exist would just
+        # make it re-index the previous release.
+        #
+        # A HARD requirement, not fire-and-forget (Tom, 2026-09-18): if this repo cannot tell
+        # packet-net/apt about the release, the build fails rather than shipping quietly with
+        # apt left stale until its next scheduled rebuild.
+        env:
+          GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
+          TAG: v${{ steps.v.outputs.version }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::APT_DISPATCH_TOKEN is not visible to this repo - cannot notify packet-net/apt"
+            exit 1
+          fi
+          # gh api --input - with a JSON body, not -f client_payload[...]=...: gh's -f does not
+          # do curl-style bracket nesting, so the nested object has to arrive as JSON.
+          payload=$(printf '{"event_type":"release-published","client_payload":{"repo":"%s","tag":"%s"}}' \
+            "$GITHUB_REPOSITORY" "$TAG")
+          printf '%s' "$payload" | gh api -X POST repos/packet-net/apt/dispatches --input -
